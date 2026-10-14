@@ -45,6 +45,7 @@ Examples:
 .\.venv\Scripts\python.exe -m toollighthouse test-leds --simulate-leds
 .\.venv\Scripts\python.exe -m toollighthouse run --mode mock --simulate-leds --camera 0 --headless --max-frames 100
 $env:TOOLLIGHTHOUSE_PAIRING_KEY = Read-Host 'Clave local para emparejar el teléfono'
+$env:TOOLLIGHTHOUSE_ADMIN_KEY = Read-Host 'Clave de administración para el dashboard'
 .\.venv\Scripts\python.exe -m toollighthouse serve --mode mock --simulate-leds --host 0.0.0.0 --port 8000
 .\.venv\Scripts\python.exe -m toollighthouse capture-reference --class-id tool_1 --output data/references --headless --crop 20,20,160,160
 .\.venv\Scripts\python.exe -m toollighthouse evaluate --mode real --gallery data/gallery.json --references data/evaluation
@@ -76,9 +77,11 @@ Optional photographic galleries (same mode must be selected when running):
 .\.venv\Scripts\python.exe -m toollighthouse build-gallery --mode real --device cuda --gallery-mode hybrid --text-weight 0.5 --inventory config/inventory.json --references data/references --output data/gallery-hybrid.json
 ```
 
-Image folders must match the nine configured `class_id` values, with at least one
-photo per class and no extra classes. Hybrid combines normalized image and text
-prototypes with `text_weight` strictly between 0 and 1 (default 0.5).
+Image folders in image-only mode must cover all nine configured `class_id` values.
+In hybrid mode, ToolLighthouse supports partial photo coverage: any subset (0 to 9) of
+categories may have reference photographs. Categories with photos combine normalized image
+and text prototypes with `text_weight` strictly between 0 and 1 (default 0.5); categories
+without photos automatically retain their zero-shot normalized text prototypes.
 
 `classifier_profiles` maps `text-only`, `image-only`, `hybrid` to independently
 configurable `threshold`/`margin` values. CLI `--classifier-threshold` and

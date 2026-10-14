@@ -77,9 +77,10 @@ export interface InventoryResponse {
 export interface StatusResponse {
   connected?: boolean
   lease?: { active?: boolean; device_id?: string; expires_at?: string; controller?: boolean }
-  arduino?: { connected?: boolean; simulated?: boolean; requested_mask?: number; confirmed_mask?: number; ack?: boolean }
+  arduino?: ArduinoStatus
   mode?: string
   simulated?: boolean
+  maintenance_mode?: boolean
   [key: string]: unknown
 }
 
@@ -87,3 +88,141 @@ export interface WsEvent {
   type: 'detection' | 'system' | 'arduino_ack' | string
   [key: string]: unknown
 }
+
+export interface ToolCategoryItem {
+  class_id: string
+  name: string
+  location: string
+  led_index: number
+  pin: number
+  descriptions: string[]
+  display_name?: string | null
+  reference_count?: number
+  [key: string]: unknown
+}
+
+export interface InventoryConfig {
+  example: boolean
+  categories: ToolCategoryItem[]
+}
+
+export interface ClassifierProfile {
+  threshold: number
+  margin: number
+}
+
+export interface SettingsConfig {
+  mode: 'mock' | 'preparation' | 'real'
+  gallery_mode: 'text-only' | 'hybrid' | 'image-only'
+  text_weight: number
+  classifier_threshold: number
+  classifier_margin: number
+  classifier_profiles?: Record<string, ClassifierProfile>
+  roi: [number, number, number, number] | null
+  inventory_confirmed: boolean
+  segmentation_min_area?: number
+  segmentation_max_area?: number
+  tracking_max_distance?: number
+  tracking_max_missed?: number
+  batch_size?: number
+  frame_max_age_seconds?: number
+  scene_ttl_seconds?: number
+  photo_retention_seconds?: number
+  prediction_max_age_seconds?: number
+  prediction_interval_seconds?: number
+}
+
+export interface ConfigResponse {
+  saved_version: number
+  active_version: number
+  is_dirty: boolean
+  settings: SettingsConfig
+  inventory: InventoryConfig
+}
+
+export interface ConfigTask {
+  state: 'idle' | 'running' | 'completed' | 'failed' | string
+  stage: string
+  progress: number
+  error: string | null
+}
+
+export interface ConfigStatusResponse {
+  saved_version: number
+  active_version: number
+  is_dirty: boolean
+  task: ConfigTask
+}
+
+export interface SystemReadiness {
+  backend_ok: boolean
+  python_version: string
+  torch_available: boolean
+  cuda_available: boolean
+  gpu_name: string | null
+  vram_free_mb: number | null
+  model_present: boolean
+  model_status: 'ready' | 'missing' | 'missing_dependency' | 'loading' | 'error' | string
+  inventory_ready: boolean
+  gallery_ready: boolean
+  calibration_ready: boolean
+  arduino_ready: boolean
+  active_mode: 'mock' | 'preparation' | 'real' | string
+  can_activate_real: boolean
+  preparation_reasons: string[]
+}
+
+export interface ReferencePhoto {
+  image_id: string
+  filename?: string
+  size_bytes?: number
+  created_at?: number
+  thumbnail_data_url: string
+}
+
+export interface ReferenceListResponse {
+  class_id: string
+  references: ReferencePhoto[]
+}
+
+export interface CalibrationMeta {
+  calibrated: boolean
+  status: 'ready' | 'missing' | string
+  image: {
+    width: number
+    height: number
+    orientation: string
+  } | null
+  roi: [number, number, number, number] | null
+}
+
+export interface ComPort {
+  port: string
+  description: string
+}
+
+export interface ArduinoStatus {
+  connected?: boolean
+  simulated?: boolean
+  requested_mask?: number | null
+  confirmed_mask?: number | null
+  ack?: boolean
+  /** Unix wall-clock seconds supplied by the backend transport status. */
+  last_ack_at?: number | null
+  port?: string | null
+  error?: string | null
+}
+
+export interface ArduinoMaintenanceResponse {
+  maintenance_mode: boolean
+  arduino: ArduinoStatus
+}
+
+export interface ArduinoLedTestResponse {
+  led_index: number
+  mask: number
+  duration_seconds: number
+  arduino: ArduinoStatus
+}
+
+export type ActiveTab = 'inspection' | 'tools' | 'calibration' | 'arduino' | 'system'

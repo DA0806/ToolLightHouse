@@ -118,3 +118,41 @@ def test_run_closes_camera_if_pipeline_initialization_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="model/gallery"):
         main(["run", "--headless", "--max-frames", "1"])
     assert FakeCamera.instances[0].closed is True
+
+
+def test_cli_serve_uses_saved_real_config_and_enters_safe_preparation(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    from toollighthouse.__main__ import main
+    from toollighthouse.config import ConfigStore, Settings
+
+    config_file = tmp_path / "saved" / "app_config.json"
+    settings = Settings(
+        mode="real",
+        pairing_key="serve-secret",
+        admin_key="admin_secret",
+        gallery_path=str(tmp_path / "saved" / "missing-gallery.json"),
+        background_path=str(tmp_path / "saved" / "missing-background.png"),
+        model_path=str(tmp_path / "saved" / "missing-model"),
+    )
+    ConfigStore(config_file).save_atomic(settings, settings.inventory)
+    captured = {}
+
+    def fake_run(app, **kwargs):
+        captured["app"] = app
+        captured["kwargs"] = kwargs
+        with TestClient(app) as client:
+            assert client.get("/health").json()["mode"] == "preparation"
+            session = client.post(
+                "/v1/sessions",
+                headers={"X-Admin-Key": "admin_secret"},
+                json={"device_id": "serve-test", "role": "admin"},
+            ).json()
+            readiness = client.get(
+                "/v1/system/readiness",
+                headers={"X-Session-Id": session["session_id"], "X-Session-Ticket": session["ticket"]},
+            ).json()
+            assert readiness["can_activate_real"] is False
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    assert main(["serve", "--config", str(config_file), "--pairing-key", "serve-secret", "--host", "127.0.0.1", "--port", "8123"]) == 0
+    assert captured["kwargs"] == {"host": "127.0.0.1", "port": 8123}

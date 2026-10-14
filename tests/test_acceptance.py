@@ -150,6 +150,43 @@ def test_serial_transport_io_failure_disconnects_and_close_sends_zero(monkeypatc
     transport.close()
 
 
+def test_serial_transport_explicit_deadline_fence_forces_stale_write_to_zero(monkeypatch):
+    fake = _FakePort(["ACK:0\n", "ACK:4\n", "ACK:0\n"])
+    monkeypatch.setattr("serial.Serial", lambda *args, **kwargs: fake)
+    monkeypatch.setattr("toollighthouse.serial_transport.time.sleep", lambda _: None)
+    transport = SerialTransport("COM-fence", retries=0)
+    transport.open()
+    assert transport.send_mask(4, retries=0) is True
+    transport.set_scene_deadline(0)
+    # A stale queued nonzero write is fail-closed after scene clear.
+    assert transport.send_mask(7, retries=0) is True
+    assert fake.writes[-1] == "MASK:0\n"
+    transport.close()
+
+
+def test_serial_transport_disconnect_stops_heartbeat_until_explicit_connect(monkeypatch):
+    instances = []
+
+    def serial_factory(*args, **kwargs):
+        port = _FakePort(["ACK:0\n"] * 20)
+        instances.append(port)
+        return port
+
+    monkeypatch.setattr("serial.Serial", serial_factory)
+    monkeypatch.setattr("toollighthouse.serial_transport.time.sleep", lambda _: None)
+    transport = SerialTransport("COM-heartbeat", retries=0, watchdog_seconds=0.02)
+    transport.open()
+    assert len(instances) == 1
+    transport.send_mask(1, retries=0)
+    transport.disconnect()
+    assert transport.status()["connected"] is False
+    threading.Event().wait(0.06)
+    assert len(instances) == 1
+    assert transport.connect() is True
+    assert len(instances) == 2
+    transport.close()
+
+
 def test_latest_inference_worker_replaces_pending_requests_without_parallel_execution():
     started = threading.Event()
     release = threading.Event()

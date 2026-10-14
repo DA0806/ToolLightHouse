@@ -76,14 +76,21 @@ def build_gallery(embedder, inventory, *, mode: str = "text-only", image_paths=(
     expected_ids = {category.class_id for category in categories}
     image_paths = list(image_paths)
     image_refs: dict[str, list[np.ndarray]] = {}
-    if mode in {"image-only", "hybrid"}:
+    if mode == "image-only":
         if not image_paths:
-            raise ValueError(f"{mode} gallery requires reference images")
+            raise ValueError("image-only gallery requires reference images")
         image_class_ids = {Path(path).parent.name for path in image_paths}
         if image_class_ids != expected_ids:
             missing = sorted(expected_ids - image_class_ids)
             extra = sorted(image_class_ids - expected_ids)
             raise ValueError(f"gallery must contain exactly the configured nine classes; missing={missing} extra={extra}")
+    elif mode == "hybrid" and image_paths:
+        image_class_ids = {Path(path).parent.name for path in image_paths}
+        extra = sorted(image_class_ids - expected_ids)
+        if extra:
+            raise ValueError(f"reference images contain unknown classes not in inventory: {extra}")
+
+    if (mode == "image-only" and image_paths) or (mode == "hybrid" and image_paths):
         from PIL import Image
 
         with ExitStack() as stack:
@@ -96,7 +103,7 @@ def build_gallery(embedder, inventory, *, mode: str = "text-only", image_paths=(
             raise ValueError("image encoder returned an unexpected number of embeddings")
         for path, vector in zip(image_paths, vectors):
             image_refs.setdefault(Path(path).parent.name, []).append(vector)
-        if set(image_refs) != expected_ids:
+        if mode == "image-only" and set(image_refs) != expected_ids:
             missing = sorted(expected_ids - set(image_refs))
             extra = sorted(set(image_refs) - expected_ids)
             raise ValueError(f"gallery must contain exactly the configured nine classes; missing={missing} extra={extra}")
@@ -127,7 +134,11 @@ def build_gallery(embedder, inventory, *, mode: str = "text-only", image_paths=(
         elif mode == "image-only":
             references[class_id] = _aggregate(image_refs[class_id])
         else:
-            references[class_id] = _unit(text_weight * text_refs[class_id] + (1 - text_weight) * _aggregate(image_refs[class_id]))
+            if class_id in image_refs and image_refs[class_id]:
+                references[class_id] = _unit(text_weight * text_refs[class_id] + (1.0 - text_weight) * _aggregate(image_refs[class_id]))
+            else:
+                references[class_id] = text_refs[class_id]
+
     manifest = {
         "version": GALLERY_VERSION,
         "gallery_mode": mode,
@@ -136,6 +147,7 @@ def build_gallery(embedder, inventory, *, mode: str = "text-only", image_paths=(
         "names": {category.class_id: category.name for category in categories},
         "preprocessing": "name-description-mean-normalized-v1",
         "image_count": len(image_paths) if mode in {"image-only", "hybrid"} else 0,
+        "image_counts": {category.class_id: len(image_refs.get(category.class_id, [])) for category in categories},
         "text_count": text_count,
     }
     return Gallery(references, manifest), manifest
@@ -165,13 +177,21 @@ def load_validated_gallery(path: str | Path, *, inventory, model_path: str, gall
         raise ValueError("gallery recipe differs from text_weight; rebuild it")
     expected_ids = {category.class_id for category in inventory.categories}
     paths = [Path(item) for item in manifest.get("paths", [])] if gallery_mode in {"image-only", "hybrid"} else []
-    if gallery_mode in {"image-only", "hybrid"}:
+    if gallery_mode == "image-only":
         root = manifest.get("references_root")
         if root:
             current = _reference_files(root)
             if {str(item.resolve()) for item in current} != {str(item.resolve()) for item in paths}:
                 raise ValueError("reference image set changed; rebuild it")
         if not paths or any(not item.exists() for item in paths):
+            raise ValueError("gallery reference images are missing; rebuild it")
+    elif gallery_mode == "hybrid":
+        root = manifest.get("references_root")
+        if root and Path(root).exists():
+            current = _reference_files(root)
+            if {str(item.resolve()) for item in current} != {str(item.resolve()) for item in paths}:
+                raise ValueError("reference image set changed; rebuild it")
+        if any(not item.exists() for item in paths):
             raise ValueError("gallery reference images are missing; rebuild it")
     fingerprint = references_fingerprint(
         paths,

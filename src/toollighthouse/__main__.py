@@ -184,7 +184,13 @@ def main(argv=None):
             serial = SerialTransport(args.serial)
             serial.open()
         from .pipeline import Pipeline
-        uvicorn.run(create_app(settings, Pipeline(settings, serial=serial)), host=args.host, port=args.port)
+        # Safe startup keeps the dashboard available while calibration/model
+        # assets are still missing; the admin can activate real mode later.
+        uvicorn.run(
+            create_app(settings, Pipeline(settings, serial=serial, safe_startup=True), config_path=args.config),
+            host=args.host,
+            port=args.port,
+        )
         return 0
     if args.command == "test-leds":
         from .serial_transport import SerialTransport, SimulatedSerial

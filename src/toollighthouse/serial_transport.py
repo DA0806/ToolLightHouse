@@ -18,6 +18,26 @@ def parse_ack(line: str) -> int:
     return validate_mask(int(match.group(1)))
 
 
+def list_com_ports() -> list[dict[str, str]]:
+    try:
+        import serial.tools.list_ports
+        ports: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in serial.tools.list_ports.comports():
+            device = str(getattr(item, "device", "") or "").strip()
+            if not device or device in seen:
+                continue
+            seen.add(device)
+            ports.append({
+                "port": device,
+                "description": str(getattr(item, "description", "") or ""),
+                "hwid": str(getattr(item, "hwid", "") or ""),
+            })
+        return ports
+    except Exception:
+        return []
+
+
 class SimulatedSerial:
     simulated = True
 
@@ -28,6 +48,21 @@ class SimulatedSerial:
         self.requested_mask = 0
         self.confirmed_mask: int | None = 0
         self.last_ack_at = time.time()
+
+    def connect(self):
+        with self._state_lock:
+            self.connected = True
+            self.confirmed_mask = 0
+            self.requested_mask = 0
+            self.last_ack_at = time.time()
+            return True
+
+    def disconnect(self):
+        with self._state_lock:
+            self.connected = False
+            self.confirmed_mask = None
+            self.requested_mask = 0
+            return True
 
     def send_mask(self, mask: int, retries: int = 2) -> bool:
         validate_mask(mask)
@@ -81,6 +116,9 @@ class SerialTransport:
 
     def set_scene_deadline(self, deadline: float):
         with self._state_lock:
+            # Any explicit fence, including zero, stays fail-closed until a
+            # newer positive scene/test deadline is assigned. A clear must not
+            # silently restore the default watchdog window for queued writes.
             self._explicit_deadline = True
             self._scene_deadline = deadline
             if deadline <= time.time():
@@ -167,6 +205,33 @@ class SerialTransport:
     def _heartbeat_loop(self):
         while not self._heartbeat_stop.wait(min(1.0, self.watchdog_seconds / 2)):
             self._refresh()
+
+    def disconnect(self):
+        heartbeat = None
+        with self._lock:
+            self._closed = True
+            self._heartbeat_stop.set()
+            with self._state_lock:
+                self.requested_mask = 0
+                self._scene_deadline = 0
+            self._exchange_locked(0, 0)
+            self._disconnect_locked()
+            heartbeat = self._heartbeat
+        if heartbeat and heartbeat is not threading.current_thread():
+            heartbeat.join(timeout=2)
+        return True
+
+    def connect(self, port: str | None = None) -> bool:
+        with self._lock:
+            if port:
+                self.port = port
+            self._closed = False
+            self._heartbeat_stop.clear()
+            connected = self._connect_locked()
+        if connected and (self._heartbeat is None or not self._heartbeat.is_alive()):
+            self._heartbeat = threading.Thread(target=self._heartbeat_loop, name="toollighthouse-serial", daemon=True)
+            self._heartbeat.start()
+        return connected
 
     def close(self):
         self._heartbeat_stop.set()

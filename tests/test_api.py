@@ -44,18 +44,106 @@ def test_second_controller_is_rejected_until_first_releases():
     assert second.status_code == 409
 
 
-def test_late_photo_cannot_apply_after_lease_expiry():
+def test_late_photo_cannot_apply_after_lease_expiry(monkeypatch, tmp_path):
+    import importlib
+
+    app_module = importlib.import_module("toollighthouse.api.app")
+    clock = [1000.0]
+    monkeypatch.setattr(app_module.time, "time", lambda: clock[0])
+
     class SlowPipeline(Pipeline):
         def process(self, *args, **kwargs):
-            time.sleep(0.03)
-            return super().process(*args, **kwargs)
+            self.process_started = True
+            result = super().process(*args, **kwargs)
+            # The request was authenticated at clock=1000.0.  Advance the
+            # controlled wall clock only after inference has produced a result
+            # so this exercises the during-inference fence deterministically.
+            clock[0] = 1001.0
+            return result
 
-    settings = Settings(mode="mock", pairing_key="secret", lease_ttl_seconds=0.01)
-    client = TestClient(create_app(settings, SlowPipeline(settings)))
+    settings = Settings(mode="mock", pairing_key="secret", lease_ttl_seconds=0.5)
+    pipeline = SlowPipeline(settings)
+    pipeline.process_started = False
+    client = TestClient(create_app(settings, pipeline, config_path=tmp_path / "app_config.json"))
     session = client.post("/v1/sessions", headers={"X-Pairing-Key": "secret"}, json={"device_id": "phone", "role": "controller"}).json()
     headers = {"X-Session-Id": session["session_id"], "X-Session-Ticket": session["ticket"]}
     response = client.post("/v1/analyze/photo", headers=headers, files={"file": ("tool.jpg", jpeg_with_tool(), "image/jpeg")})
     assert response.status_code == 409
+    assert pipeline.process_started is True
+    assert pipeline.serial.status()["requested_mask"] == 0
+    assert pipeline.serial.status()["confirmed_mask"] == 0
+
+
+def test_admin_controller_lease_renews_on_use_and_expires_for_next_admin():
+    settings = Settings(
+        mode="mock",
+        admin_key="admin_secret",
+        pairing_key="secret",
+        lease_ttl_seconds=0.5,
+    )
+    client = TestClient(create_app(settings))
+
+    def admin(device):
+        session = client.post(
+            "/v1/sessions",
+            headers={"X-Admin-Key": "admin_secret"},
+            json={"device_id": device, "role": "admin"},
+        ).json()
+        return {"X-Session-Id": session["session_id"], "X-Session-Ticket": session["ticket"]}
+
+    first = admin("admin-one")
+    second = admin("admin-two")
+    invalid_upload = {"file": ("invalid.jpg", b"not-an-image", "image/jpeg")}
+
+    # A controller-capable admin claims the exclusive lease even when the
+    # request later fails image validation.
+    assert client.post("/v1/analyze/photo", headers=first, files=invalid_upload).status_code == 400
+    assert client.post("/v1/analyze/photo", headers=second, files=invalid_upload).status_code == 409
+
+    time.sleep(0.1)
+    # A valid controller request renews the admin lease before validation.
+    assert client.post("/v1/analyze/photo", headers=first, files=invalid_upload).status_code == 400
+    time.sleep(0.1)
+    assert client.post("/v1/analyze/photo", headers=second, files=invalid_upload).status_code == 409
+
+    time.sleep(0.7)
+    # After TTL expiry, the second admin can claim the controller lease.
+    assert client.post("/v1/analyze/photo", headers=second, files=invalid_upload).status_code == 400
+
+
+def test_real_mode_config_apply_and_mode_endpoint_cannot_bypass_readiness(tmp_path):
+    settings = Settings(
+        mode="mock",
+        pairing_key="secret",
+        admin_key="admin_secret",
+        model_path=str(tmp_path / "missing-model"),
+        gallery_path=str(tmp_path / "missing-gallery.json"),
+        background_path=str(tmp_path / "missing-background.png"),
+    )
+    client = TestClient(create_app(settings, config_path=tmp_path / "app_config.json"))
+    session = client.post(
+        "/v1/sessions",
+        headers={"X-Admin-Key": "admin_secret"},
+        json={"device_id": "readiness", "role": "admin"},
+    ).json()
+    headers = {"X-Session-Id": session["session_id"], "X-Session-Ticket": session["ticket"]}
+    cfg = client.get("/v1/config", headers=headers).json()
+    real_settings = dict(cfg["settings"])
+    real_settings["mode"] = "real"
+    update = client.put(
+        "/v1/config",
+        headers=headers,
+        json={"settings": real_settings, "inventory": cfg["inventory"]},
+    )
+    assert update.status_code == 200
+    assert update.json()["is_dirty"] is True
+    apply = client.post("/v1/config/apply", headers=headers)
+    assert apply.status_code == 400
+    assert "failed to rebuild gallery" in apply.json()["detail"].lower()
+    mode = client.post("/v1/system/mode", headers=headers, json={"mode": "real"})
+    assert mode.status_code == 409
+    assert "cannot activate real mode" in mode.json()["detail"].lower()
+    assert client.get("/health").json()["mode"] == "mock"
 
 
 def test_stream_endpoint_accepts_latest_only_slot():

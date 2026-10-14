@@ -1,6 +1,39 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { analyzePhoto, ApiError, calibrateBackground, createSession, createWsTicket, defaultApiUrl, getInventory, getStatus, openEvents, releaseSession, streamFrame, type Credentials } from './api'
-import type { AnalysisResponse, ConnectionState, Detection, InventoryItem, StatusResponse, WsEvent } from './types'
+import {
+  analyzePhoto,
+  ApiError,
+  applyConfig,
+  calibrateBackground,
+  createSession,
+  createWsTicket,
+  defaultApiUrl,
+  getConfig,
+  getConfigStatus,
+  getInventory,
+  getStatus,
+  openEvents,
+  releaseSession,
+  streamFrame,
+  updateConfig,
+  type Credentials,
+} from './api'
+import type {
+  ActiveTab,
+  AnalysisResponse,
+  ConfigResponse,
+  ConfigStatusResponse,
+  ConnectionState,
+  Detection,
+  InventoryItem,
+  StatusResponse,
+  SettingsConfig,
+  WsEvent,
+} from './types'
+import { Navigation } from './components/Navigation'
+import { ToolManager } from './components/ToolManager'
+import { CalibrationView } from './components/CalibrationView'
+import { ArduinoPanel } from './components/ArduinoPanel'
+import { SystemPanel } from './components/SystemPanel'
 import './styles.css'
 
 const DEVICE_KEY = 'toollighthouse.device-id'
@@ -79,7 +112,12 @@ export default function App() {
   const [apiUrl, setApiUrl] = useStoredValue(URL_KEY, defaultApiUrl())
   const [deviceId, setDeviceId] = useStoredValue(DEVICE_KEY, `phone-${Math.random().toString(36).slice(2, 8)}`)
   const [pairingKey, setPairingKey] = useState('')
-  const [requestedRole, setRequestedRole] = useState<'controller' | 'reader'>('controller')
+  const [requestedRole, setRequestedRole] = useState<'controller' | 'reader' | 'admin'>('controller')
+  const [activeTab, setActiveTab] = useState<ActiveTab>('inspection')
+  const [config, setConfig] = useState<ConfigResponse | null>(null)
+  const [draftConfig, setDraftConfig] = useState<ConfigResponse | null>(null)
+  const [configStatus, setConfigStatus] = useState<ConfigStatusResponse | null>(null)
+  const [applyingConfig, setApplyingConfig] = useState(false)
   const [session, setSession] = useState<Credentials | null>(null)
   const [connection, setConnection] = useState<ConnectionState>('disconnected')
   const [status, setStatus] = useState<StatusResponse | null>(null)
@@ -113,8 +151,77 @@ export default function App() {
   const previewUrl = useRef<string | null>(null)
   const viewerRef = useRef<HTMLDivElement>(null)
   const invalidateSessionRef = useRef<(message: string) => void>(() => undefined)
+  const configRef = useRef<ConfigResponse | null>(null)
+  const draftConfigRef = useRef<ConfigResponse | null>(null)
 
-  const canControl = session?.role === 'controller'
+  configRef.current = config
+  draftConfigRef.current = draftConfig
+
+  const canControl = session?.role === 'controller' || session?.role === 'admin'
+
+  const hasLocalDraftChanges = useMemo(() => {
+    if (!config || !draftConfig) return false
+    return (
+      JSON.stringify(config.inventory) !== JSON.stringify(draftConfig.inventory) ||
+      JSON.stringify(config.settings) !== JSON.stringify(draftConfig.settings)
+    )
+  }, [config, draftConfig])
+
+  const draftsMatchServer = useCallback(() => {
+    const server = configRef.current
+    const draft = draftConfigRef.current
+    if (!server || !draft) return true
+    return JSON.stringify(server.settings) === JSON.stringify(draft.settings) &&
+      JSON.stringify(server.inventory) === JSON.stringify(draft.inventory)
+  }, [])
+
+  const refreshServerConfigIfClean = useCallback(() => {
+    const requestSession = sessionRef.current
+    const requestGeneration = sessionGeneration.current
+    if (!requestSession || !draftsMatchServer()) return
+    void getConfig(apiUrl, requestSession).then((latest) => {
+      if (
+        mounted.current &&
+        sessionRef.current === requestSession &&
+        sessionGeneration.current === requestGeneration &&
+        draftsMatchServer()
+      ) {
+        setConfig(latest)
+        setDraftConfig(latest)
+      }
+    }).catch(() => undefined)
+  }, [apiUrl, draftsMatchServer])
+
+  const mergeReferenceRefresh = useCallback((latest: ConfigResponse, acceptedSettings: Array<keyof SettingsConfig> = []) => {
+    setConfig(latest)
+    setDraftConfig((previous) => {
+      if (!previous) return latest
+      const server = configRef.current
+      const dirty = server && (
+        JSON.stringify(server.settings) !== JSON.stringify(previous.settings) ||
+        JSON.stringify(server.inventory) !== JSON.stringify(previous.inventory)
+      )
+      if (!dirty) return latest
+      const remoteById = new Map((latest.inventory.categories || []).map((item) => [item.class_id, item]))
+      return {
+        ...previous,
+        saved_version: latest.saved_version,
+        active_version: latest.active_version,
+        is_dirty: true,
+        settings: {
+          ...previous.settings,
+          ...Object.fromEntries(acceptedSettings.map((key) => [key, latest.settings[key]])),
+        } as SettingsConfig,
+        inventory: {
+          ...previous.inventory,
+          categories: previous.inventory.categories.map((item) => ({
+            ...item,
+            reference_count: remoteById.get(item.class_id)?.reference_count ?? item.reference_count,
+          })),
+        },
+      }
+    })
+  }, [])
 
   const setPreviewSafely = useCallback((next: { blob: Blob; url: string; width: number; height: number }) => {
     if (previewUrl.current) URL.revokeObjectURL(previewUrl.current)
@@ -159,9 +266,120 @@ export default function App() {
     if (continuousMode.current && event.type === 'detection') return
     if (result && sessionRef.current && result.frame_id) void acceptResult(result, undefined, isCurrent)
     if (event.type === 'system' && event.event === 'controller_released') setLeaseMessage('El control fue liberado por el servidor.')
+    if (event.type === 'system') {
+      if (event.event === 'config_changed') {
+        const sVer = Number(event.saved_version ?? 1)
+        const aVer = Number(event.active_version ?? 1)
+        setConfig((prev) => prev ? {
+          ...prev,
+          saved_version: sVer,
+          active_version: aVer,
+          is_dirty: Boolean(event.is_dirty),
+        } : prev)
+        refreshServerConfigIfClean()
+      } else if (event.event === 'config_applied' || event.event === 'gallery_ready') {
+        const nextActive = Number(event.active_version ?? 1)
+        setConfig((prev) => prev ? {
+          ...prev,
+          active_version: nextActive,
+          is_dirty: false,
+        } : prev)
+        if (draftsMatchServer()) {
+          setDraftConfig((prev) => prev ? { ...prev, active_version: nextActive, is_dirty: false } : prev)
+          refreshServerConfigIfClean()
+        }
+      } else if (event.event === 'config_rolled_back') {
+        const sVer = Number(event.saved_version ?? 1)
+        const aVer = Number(event.active_version ?? 1)
+        setConfig((prev) => prev ? {
+          ...prev,
+          saved_version: sVer,
+          active_version: aVer,
+          is_dirty: false,
+        } : prev)
+        refreshServerConfigIfClean()
+      } else if (event.event === 'mode_changed' && event.mode) {
+        const nextMode = String(event.mode)
+        setStatus((prev) => prev ? { ...prev, mode: nextMode } : prev)
+        setConfig((prev) => prev ? {
+          ...prev,
+          settings: { ...prev.settings, mode: nextMode as 'mock' | 'preparation' | 'real' },
+        } : prev)
+        if (draftsMatchServer()) {
+          setDraftConfig((prev) => prev ? {
+            ...prev,
+            settings: { ...prev.settings, mode: nextMode as 'mock' | 'preparation' | 'real' },
+          } : prev)
+        }
+      } else if (event.event === 'roi_updated' && Array.isArray(event.roi)) {
+        const nextRoi = event.roi as [number, number, number, number]
+        setConfig((prev) => prev ? {
+          ...prev,
+          settings: { ...prev.settings, roi: nextRoi },
+        } : prev)
+        if (draftsMatchServer()) {
+          setDraftConfig((prev) => prev ? {
+            ...prev,
+            settings: { ...prev.settings, roi: nextRoi },
+          } : prev)
+        }
+      } else if (event.event === 'task_status' && event.task) {
+        setConfigStatus((prev) => ({
+          saved_version: prev?.saved_version ?? 1,
+          active_version: prev?.active_version ?? 1,
+          is_dirty: prev?.is_dirty ?? false,
+          task: event.task as ConfigStatusResponse['task'],
+        }))
+      } else if (event.event === 'gallery_building') {
+        setConfigStatus((prev) => ({
+          saved_version: prev?.saved_version ?? 1,
+          active_version: prev?.active_version ?? 1,
+          is_dirty: prev?.is_dirty ?? false,
+          task: {
+            state: 'running',
+            stage: String(event.stage || 'building'),
+            progress: Number(event.progress || 0),
+            error: null,
+          },
+        }))
+      } else if (event.event === 'gallery_error') {
+        setConfigStatus((prev) => ({
+          saved_version: prev?.saved_version ?? 1,
+          active_version: prev?.active_version ?? 1,
+          is_dirty: prev?.is_dirty ?? false,
+          task: {
+            state: 'failed',
+            stage: 'failed',
+            progress: 0,
+            error: String(event.detail || 'Error en galería'),
+          },
+        }))
+      } else if (event.event === 'arduino_state_changed' && event.arduino) {
+        setStatus((prev) => prev ? { ...prev, arduino: event.arduino as StatusResponse['arduino'] } : prev)
+      } else if (event.event === 'maintenance_mode') {
+        const nextMaint = Boolean(event.maintenance_mode)
+        setStatus((prev) => prev ? {
+          ...prev,
+          maintenance_mode: nextMaint,
+          arduino: (event.arduino as StatusResponse['arduino']) || prev?.arduino,
+        } : prev)
+        if (nextMaint) {
+          cameraRequestGeneration.current += 1
+          streamGeneration.current += 1
+          cameraStream.current?.getTracks().forEach((track) => track.stop())
+          cameraStream.current = null
+          if (videoRef.current) videoRef.current.srcObject = null
+          setCameraOn(false)
+          setContinuous(false)
+        }
+      }
+    }
     const ack = event.arduino || (event.requested_mask !== undefined ? event : undefined)
-    if (event.type === 'arduino_ack' && ack && isCurrent()) setAnalysis((current) => current ? { ...current, arduino: ack as AnalysisResponse['arduino'] } : current)
-  }, [acceptResult])
+    if (event.type === 'arduino_ack' && ack && isCurrent()) {
+      setAnalysis((current) => current ? { ...current, arduino: ack as AnalysisResponse['arduino'] } : current)
+      setStatus((prev) => prev ? { ...prev, arduino: ack as StatusResponse['arduino'] } : prev)
+    }
+  }, [acceptResult, draftsMatchServer, refreshServerConfigIfClean])
 
   const connectSocket = useCallback((credentials: Credentials) => {
     socketRef.current?.close()
@@ -203,7 +421,7 @@ export default function App() {
     let created: Credentials | null = null
     try {
       const response = await createSession(apiUrl, pairingKey, deviceId, requestedRole)
-      created = { sessionId: response.session_id, ticket: response.ticket, role: requestedRole }
+      created = { sessionId: response.session_id, ticket: response.ticket, role: (response.role || requestedRole) as 'controller' | 'reader' | 'admin' }
       const credentials: Credentials = created
       sessionGeneration.current += 1
       sceneGeneration.current += 1
@@ -215,6 +433,23 @@ export default function App() {
       setStatus(nextStatus)
       setInventory(nextInventory.categories || [])
       setInventoryExample(Boolean(nextInventory.example))
+      try {
+        const nextConfig = await getConfig(apiUrl, credentials)
+        if (sessionRef.current === credentials) {
+          setConfig(nextConfig)
+          setDraftConfig(nextConfig)
+        }
+      } catch (caught) {
+        if (sessionRef.current === credentials) {
+          setError(caught instanceof Error ? caught.message : 'No se pudo cargar la configuración')
+        }
+      }
+      try {
+        const nextConfigStatus = await getConfigStatus(apiUrl, credentials)
+        if (sessionRef.current === credentials) setConfigStatus(nextConfigStatus)
+      } catch {
+        /* status is non-fatal if endpoint is temporarily unavailable */
+      }
       connectSocket(credentials)
       setConnection('connected')
     } catch (caught) {
@@ -225,6 +460,44 @@ export default function App() {
       setError(caught instanceof ApiError && caught.status === 409 ? 'Otro teléfono ya controla el Arduino. Libera esa sesión antes de conectar.' : caught instanceof Error ? caught.message : 'No se pudo conectar')
     }
   }
+
+  const handleApplyConfig = async () => {
+    if (!session || session.role !== 'admin') return
+    setApplyingConfig(true)
+    setError('')
+    try {
+      if (hasLocalDraftChanges && draftConfig && config) {
+        const saved = await updateConfig(apiUrl, session, {
+          expected_version: draftConfig.saved_version,
+          settings: draftConfig.settings,
+          inventory: draftConfig.inventory,
+        })
+        setConfig(saved)
+        setDraftConfig(saved)
+      }
+      const res = await applyConfig(apiUrl, session)
+      setConfig(res)
+      setDraftConfig(res)
+      setInventory(res.inventory?.categories || [])
+      setInventoryExample(Boolean(res.inventory?.example))
+    } catch (caught: unknown) {
+      const isConflict =
+        (caught instanceof ApiError && caught.status === 409) ||
+        (typeof caught === 'object' && caught !== null && 'status' in caught && (caught as { status: number }).status === 409)
+      if (isConflict) {
+        setError('Conflicto de versiones al guardar: otro cambio modificó la configuración en el servidor. Revisa los cambios o recarga la configuración.')
+      } else {
+        setError(caught instanceof Error ? caught.message : 'Error al aplicar configuración')
+      }
+    } finally {
+      setApplyingConfig(false)
+    }
+  }
+
+  const handleConfigUpdated = useCallback((next: ConfigResponse) => {
+    setConfig(next)
+    setDraftConfig(next)
+  }, [])
 
   const stopCamera = useCallback(() => {
     cameraRequestGeneration.current += 1
@@ -247,7 +520,7 @@ export default function App() {
     reconnectAttempts.current = 0
     stopCamera()
     latestFrame.current = null; continuousBusy.current = false
-    setSession(null); setStatus(null); setInventory([]); setInventoryExample(false); setAnalysis(null); setConnection('error'); setLeaseMessage(message)
+    setSession(null); setStatus(null); setConfig(null); setConfigStatus(null); setInventory([]); setInventoryExample(false); setAnalysis(null); setConnection('error'); setLeaseMessage(message)
   }, [stopCamera])
 
   invalidateSessionRef.current = invalidateSession
@@ -296,6 +569,7 @@ export default function App() {
 
   const inspect = async (blob = preview?.blob) => {
     if (!session) { setError('Conecta una sesión de controlador antes de analizar.'); return }
+    if (status?.maintenance_mode) { setError('El análisis está deshabilitado durante el modo de mantenimiento de Arduino.'); return }
     if (!blob) { setError('Selecciona una imagen o inicia la cámara.'); return }
     const requestSession = session
     const requestSessionGeneration = sessionGeneration.current
@@ -315,6 +589,7 @@ export default function App() {
 
   const startCamera = async () => {
     if (!canControl) { setError('El modo lector puede consultar resultados, pero no controla la cámara ni el Arduino.'); return }
+    if (status?.maintenance_mode) { setError('La cámara está deshabilitada durante el modo de mantenimiento de Arduino.'); return }
     const requestGeneration = ++cameraRequestGeneration.current
     cameraStream.current?.getTracks().forEach((track) => track.stop())
     cameraStream.current = null
@@ -322,7 +597,7 @@ export default function App() {
     setError('')
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false })
-      if (!mounted.current || requestGeneration !== cameraRequestGeneration.current || !sessionRef.current || sessionRef.current.role !== 'controller') {
+      if (!mounted.current || requestGeneration !== cameraRequestGeneration.current || !sessionRef.current || (sessionRef.current.role !== 'controller' && sessionRef.current.role !== 'admin')) {
         stream.getTracks().forEach((track) => track.stop())
         return
       }
@@ -352,7 +627,13 @@ export default function App() {
     const current = session
     const poll = window.setInterval(() => {
       void getStatus(apiUrl, current, 4000).then((next) => {
-        if (mounted.current && sessionRef.current === current) setStatus(next)
+        if (mounted.current && sessionRef.current === current) {
+          setStatus((prev) => prev ? {
+            ...prev,
+            ...next,
+            maintenance_mode: next.maintenance_mode !== undefined ? Boolean(next.maintenance_mode) : prev.maintenance_mode,
+          } : next)
+        }
       }).catch((caught) => {
         if (caught instanceof ApiError && (caught.status === 401 || caught.status === 409)) invalidateSession('La sesión expiró. Empareja el teléfono de nuevo.')
       })
@@ -417,40 +698,120 @@ export default function App() {
       <div className={`connection connection-${connection}`} aria-live="polite"><i aria-hidden="true" />{connectionLabel(connection)}</div>
     </header>
 
-    <div className="layout">
-      <section className="workspace" aria-label="Captura y análisis">
-        <div className="section-heading"><div><p className="eyebrow">Escena</p><h2>Inspección fotográfica</h2></div><span className="mode-chip">{simulation ? 'Simulación activa' : analysis?.mode || 'Listo'}</span></div>
-        <div ref={viewerRef} className={`viewer ${preview ? 'viewer-ready' : ''}`}>
-          {preview ? <svg className="preview-svg" viewBox={`0 0 ${imageWidth} ${imageHeight}`} preserveAspectRatio={preserve} role="img" aria-label="Fotografía con detecciones">
-            <image href={preview.url} x="0" y="0" width={imageWidth} height={imageHeight} preserveAspectRatio={preserve} />
-            {detections.map((d: Detection) => <g key={`${d.track_id}-${d.class_id}`}>
-              <rect className="bbox" x={d.bbox[0]} y={d.bbox[1]} width={d.bbox[2]} height={d.bbox[3]} />
-              <text className="bbox-label" style={{ fontSize: `${overlayFontSize}px` }} x={d.bbox[0] + 8} y={Math.max(20, d.bbox[1] + overlayFontSize + 4)}>{d.name || 'Sin identificar'}</text>
-            </g>)}
-          </svg> : <div className="empty-viewer"><span className="crosshair" aria-hidden="true">＋</span><strong>La bandeja aparecerá aquí</strong><span>Elige una foto o abre la cámara para comenzar.</span></div>}
-          <video className={`camera-preview ${cameraOn ? '' : 'camera-hidden'}`} ref={videoRef} muted playsInline aria-label="Vista previa de la cámara" />
-          {busy && <div className="viewer-busy" role="status">Analizando en la laptop…</div>}
-        </div>
-        <div className="capture-row">
-          <label className="button button-primary"><span aria-hidden="true">↥</span> Elegir foto<input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => void chooseImage(event.target.files?.[0])} /></label>
-          <button className="button button-secondary" onClick={() => cameraOn ? stopCamera() : void startCamera()} disabled={!canControl}>{cameraOn ? 'Cerrar cámara' : 'Abrir cámara'}</button>
-          {cameraOn && <button className="button button-accent" onClick={() => void captureFromVideo().then((blob) => { if (!blob) return; const width = videoRef.current?.videoWidth || 1; const height = videoRef.current?.videoHeight || 1; setPreviewSafely({ blob, url: URL.createObjectURL(blob), width, height }); stopCamera(); void inspect(blob) })} disabled={busy || !canControl}>Analizar toma</button>}
-          {!cameraOn && <button className="button button-accent" onClick={() => void inspect()} disabled={busy || !preview || !canControl}>{busy ? 'Analizando…' : 'Analizar foto'}</button>}
-        </div>
-        <div className="viewer-tools"><span>Vista del overlay</span><button className={fit === 'contain' ? 'selected' : ''} onClick={() => setFit('contain')}>Completa</button><button className={fit === 'cover' ? 'selected' : ''} onClick={() => setFit('cover')}>Recortada</button><label className="continuous-toggle"><input type="checkbox" checked={continuous} onChange={(e) => setContinuous(e.target.checked)} disabled={!cameraOn || !session} /> Continuo <small>experimental</small></label></div>
-        {error && <div className="alert alert-error" role="alert"><strong>No se completó la acción.</strong> {error}</div>}
-        {leaseMessage && <div className="alert alert-info" role="status">{leaseMessage}</div>}
-      </section>
+    <Navigation
+      activeTab={activeTab}
+      onChangeTab={setActiveTab}
+      isDirty={Boolean(config?.is_dirty)}
+      hasLocalChanges={hasLocalDraftChanges}
+      savedVersion={config?.saved_version}
+      activeVersion={config?.active_version}
+      task={configStatus?.task}
+      onApplyConfig={session?.role === 'admin' ? () => void handleApplyConfig() : undefined}
+      applying={applyingConfig}
+    />
 
-      <aside className="results" aria-label="Resultados de la inspección">
-        <section className="panel result-panel"><div className="panel-heading"><div><p className="eyebrow">Lectura</p><h2>Herramientas detectadas</h2></div><span className="count">{detections.length}</span></div>
-          {detections.length ? <div className="detection-list">{detections.map((d) => <article className="detection" key={`${d.track_id}-${d.class_id}`}><div className="detection-mark" aria-hidden="true" /><div><strong>{d.name || 'Sin identificar'}</strong><span>{displayLocation(d.location)} · track {d.track_id} · similitud {formatSimilarity(d.similarity_top1)}</span></div><b>{d.validation === 'simulated' ? 'SIM' : d.class_id}</b></article>)}</div> : <p className="empty-copy">Las lecturas válidas de la fotografía aparecerán aquí. Los objetos ambiguos permanecen sin asignación.</p>}
+    {error && activeTab !== 'inspection' && (
+      <div className="alert alert-error global-error" role="alert">
+        <strong>Atención:</strong> {error}
+      </div>
+    )}
+
+    {activeTab === 'inspection' && (
+      <div className="layout">
+        <section className="workspace" aria-label="Captura y análisis">
+          {status?.maintenance_mode && (
+            <div className="alert alert-warning" role="alert">
+              <strong>Modo de mantenimiento activo:</strong> La cámara, captura y análisis están bloqueados hasta que finalice el mantenimiento de Arduino.
+            </div>
+          )}
+          <div className="section-heading"><div><p className="eyebrow">Escena</p><h2>Inspección fotográfica</h2></div><span className="mode-chip">{simulation ? 'Simulación activa' : analysis?.mode || 'Listo'}</span></div>
+          <div ref={viewerRef} className={`viewer ${preview ? 'viewer-ready' : ''}`}>
+            {preview ? <svg className="preview-svg" viewBox={`0 0 ${imageWidth} ${imageHeight}`} preserveAspectRatio={preserve} role="img" aria-label="Fotografía con detecciones">
+              <image href={preview.url} x="0" y="0" width={imageWidth} height={imageHeight} preserveAspectRatio={preserve} />
+              {detections.map((d: Detection) => <g key={`${d.track_id}-${d.class_id}`}>
+                <rect className="bbox" x={d.bbox[0]} y={d.bbox[1]} width={d.bbox[2]} height={d.bbox[3]} />
+                <text className="bbox-label" style={{ fontSize: `${overlayFontSize}px` }} x={d.bbox[0] + 8} y={Math.max(20, d.bbox[1] + overlayFontSize + 4)}>{d.name || 'Sin identificar'}</text>
+              </g>)}
+            </svg> : <div className="empty-viewer"><span className="crosshair" aria-hidden="true">＋</span><strong>La bandeja aparecerá aquí</strong><span>Elige una foto o abre la cámara para comenzar.</span></div>}
+            <video className={`camera-preview ${cameraOn ? '' : 'camera-hidden'}`} ref={videoRef} muted playsInline aria-label="Vista previa de la cámara" />
+            {busy && <div className="viewer-busy" role="status">Analizando en la laptop…</div>}
+          </div>
+          <div className="capture-row">
+            <label className="button button-primary"><span aria-hidden="true">↥</span> Elegir foto<input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; void chooseImage(file) }} /></label>
+            <button className="button button-secondary" onClick={() => cameraOn ? stopCamera() : void startCamera()} disabled={!canControl || Boolean(status?.maintenance_mode)}>{cameraOn ? 'Cerrar cámara' : 'Abrir cámara'}</button>
+            {cameraOn && <button className="button button-accent" onClick={() => void captureFromVideo().then((blob) => { if (!blob) return; const width = videoRef.current?.videoWidth || 1; const height = videoRef.current?.videoHeight || 1; setPreviewSafely({ blob, url: URL.createObjectURL(blob), width, height }); stopCamera(); void inspect(blob) })} disabled={busy || !canControl || Boolean(status?.maintenance_mode)}>Analizar toma</button>}
+            {!cameraOn && <button className="button button-accent" onClick={() => void inspect()} disabled={busy || !preview || !canControl || Boolean(status?.maintenance_mode)}>{busy ? 'Analizando…' : 'Analizar foto'}</button>}
+          </div>
+          <div className="viewer-tools"><span>Vista del overlay</span><button className={fit === 'contain' ? 'selected' : ''} onClick={() => setFit('contain')}>Completa</button><button className={fit === 'cover' ? 'selected' : ''} onClick={() => setFit('cover')}>Recortada</button><label className="continuous-toggle"><input type="checkbox" checked={continuous} onChange={(e) => setContinuous(e.target.checked)} disabled={!cameraOn || !session} /> Continuo <small>experimental</small></label></div>
+          {error && <div className="alert alert-error" role="alert"><strong>No se completó la acción.</strong> {error}</div>}
+          {leaseMessage && <div className="alert alert-info" role="status">{leaseMessage}</div>}
         </section>
-        <section className="panel led-panel"><div className="panel-heading"><div><p className="eyebrow">Salida física</p><h2>Mapa de luces</h2></div><span className={`ack ${analysis?.arduino.ack ? 'ack-ok' : ''}`}>{analysis ? analysis.arduino.ack ? analysis.arduino.simulated ? 'ACK simulado' : 'ACK confirmado' : 'Sin confirmación' : 'Sin lectura'}</span></div><div className="led-grid">{ledItems.map((led) => <div className="led-cell" key={led.bit}><span className={`led ${led.confirmed === true ? 'led-confirmed' : led.requested ? 'led-requested' : ''}`} aria-label={`${led.name}: ${led.confirmed === null ? 'sin confirmación' : led.confirmed ? 'confirmada' : led.requested ? 'solicitada' : 'apagada'}`} /><div><strong>{led.name}</strong><span>{led.confirmed === null ? 'Sin confirmación' : led.confirmed ? 'Confirmada' : led.requested ? 'Solicitada' : 'Apagada'}</span></div></div>)}</div><p className="legend"><span className="dot dot-confirmed" /> Confirmada <span className="dot dot-requested" /> Solicitada</p></section>
-        {analysis && <section className="panel detail-panel"><div className="panel-heading"><div><p className="eyebrow">Trazabilidad</p><h2>Detalle de lectura</h2></div></div><div className="detail-grid"><span>Frame <strong>{analysis.frame_id.slice(0, 12)}</strong></span><span>Track <strong>{analysis.detections[0]?.track_id ?? '—'}</strong></span><span>Modo <strong>{analysis.mode}</strong></span><span>Validación <strong>{analysis.detections[0]?.validation || 'Sin detecciones'}</strong></span><span>Captura <strong>{formatMetric(analysis.metrics?.capture_fps, 'fps')}</strong></span><span>Presentación <strong>{formatMetric(analysis.metrics?.display_fps, 'fps')}</strong></span><span>Inferencia <strong>{formatMetric(analysis.metrics?.inference_hz, 'Hz')}</strong></span><span>Latencia p50 <strong>{formatMetric(analysis.metrics?.inference_ms_p50, 'ms')}</strong><small>{metricSampleLabel(analysis.metrics?.stages?.embed?.sample_count ?? analysis.metrics?.sample_count)}</small></span><span>Latencia p95 <strong>{formatMetric(analysis.metrics?.inference_ms_p95, 'ms')}</strong><small>{metricSampleLabel(analysis.metrics?.stages?.embed?.sample_count ?? analysis.metrics?.sample_count)}</small></span><span>VRAM <strong>{formatMetric(analysis.metrics?.vram_mb, 'MB', 'No disponible')}</strong></span><span>Backend → ACK <strong>{formatMetric(analysis.metrics?.capture_to_ack_ms, 'ms', analysis.simulated || analysis.arduino.simulated ? 'No disponible en simulación' : 'Sin muestras suficientes')}</strong></span>{Object.entries(analysis.metrics?.stages || analysis.metrics?.stage_ms || {}).map(([stage, metric]) => <span key={stage}>{stage} <strong>{formatMetric(metric?.p50_ms, 'ms')}</strong><small>{metricSampleLabel(metric?.sample_count)}</small></span>)}</div></section>}
-        <section className="panel settings-panel"><button className="panel-heading disclosure" onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen}><div><p className="eyebrow">Conexión</p><h2>Sesión y backend</h2></div><span aria-hidden="true">{settingsOpen ? '⌃' : '⌄'}</span></button>{settingsOpen && <div className="settings-body"><label>URL del backend<input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} disabled={Boolean(session)} placeholder="http://192.168.1.20:8000" /></label><label>ID de este teléfono<input value={deviceId} onChange={(e) => setDeviceId(e.target.value)} disabled={Boolean(session)} /></label><label>Rol de sesión<select value={requestedRole} onChange={(e) => setRequestedRole(e.target.value as 'controller' | 'reader')} disabled={Boolean(session)}><option value="controller">Controlador · cámara y Arduino</option><option value="reader">Lector · solo resultados</option></select></label><label>Clave de emparejamiento<input type="password" value={pairingKey} onChange={(e) => setPairingKey(e.target.value)} disabled={Boolean(session)} placeholder="Configurada en la laptop" /></label>{session ? <button className="button button-danger full" onClick={() => void release()}>Liberar sesión</button> : <button className="button button-accent full" onClick={() => void connect()} disabled={connection === 'checking' || !apiUrl}>{connection === 'checking' ? 'Verificando…' : 'Verificar y conectar'}</button>}{preview && canControl && <button className="button button-secondary full" onClick={() => void (async () => { setCalibrating(true); setError(''); try { await calibrateBackground(apiUrl, session, preview.blob); setLeaseMessage('Fondo vacío guardado para esta cámara.') } catch (caught) { setError(caught instanceof Error ? caught.message : 'No se pudo guardar el fondo') } finally { setCalibrating(false) } })()} disabled={calibrating}>{calibrating ? 'Guardando fondo…' : 'Usar foto actual como fondo vacío'}</button>}<div className="connection-note"><span className={`status-dot status-${connection}`} />{session ? session.role === 'reader' ? 'Sesión lectora; no controla el Arduino' : 'Control exclusivo de este teléfono' : 'Sin sesión de control'}{status?.arduino?.simulated && <em>Arduino simulado</em>}</div>{inventory.length > 0 && <p className="inventory-note">{inventoryExample ? 'Inventario de ejemplo' : 'Inventario confirmado'}: {inventory.map((item, index) => item.name || item.location || `LED ${item.led_index ?? item.bit ?? index}`).join(' · ')}</p>}</div>}</section>
-      </aside>
-    </div>
+
+        <aside className="results" aria-label="Resultados de la inspección">
+          <section className="panel result-panel"><div className="panel-heading"><div><p className="eyebrow">Lectura</p><h2>Herramientas detectadas</h2></div><span className="count">{detections.length}</span></div>
+            {detections.length ? <div className="detection-list">{detections.map((d) => <article className="detection" key={`${d.track_id}-${d.class_id}`}><div className="detection-mark" aria-hidden="true" /><div><strong>{d.name || 'Sin identificar'}</strong><span>{displayLocation(d.location)} · track {d.track_id} · similitud {formatSimilarity(d.similarity_top1)}</span></div><b>{d.validation === 'simulated' ? 'SIM' : d.class_id}</b></article>)}</div> : <p className="empty-copy">Las lecturas válidas de la fotografía aparecerán aquí. Los objetos ambiguos permanecen sin asignación.</p>}
+          </section>
+          <section className="panel led-panel"><div className="panel-heading"><div><p className="eyebrow">Salida física</p><h2>Mapa de luces</h2></div><span className={`ack ${analysis?.arduino.ack ? 'ack-ok' : ''}`}>{analysis ? analysis.arduino.ack ? analysis.arduino.simulated ? 'ACK simulado' : 'ACK confirmado' : 'Sin confirmación' : 'Sin lectura'}</span></div><div className="led-grid">{ledItems.map((led) => <div className="led-cell" key={led.bit}><span className={`led ${led.confirmed === true ? 'led-confirmed' : led.requested ? 'led-requested' : ''}`} aria-label={`${led.name}: ${led.confirmed === null ? 'sin confirmación' : led.confirmed ? 'confirmada' : led.requested ? 'solicitada' : 'apagada'}`} /><div><strong>{led.name}</strong><span>{led.confirmed === null ? 'Sin confirmación' : led.confirmed ? 'Confirmada' : led.requested ? 'Solicitada' : 'Apagada'}</span></div></div>)}</div><p className="legend"><span className="dot dot-confirmed" /> Confirmada <span className="dot dot-requested" /> Solicitada</p></section>
+          {analysis && <section className="panel detail-panel"><div className="panel-heading"><div><p className="eyebrow">Trazabilidad</p><h2>Detalle de lectura</h2></div></div><div className="detail-grid"><span>Frame <strong>{analysis.frame_id.slice(0, 12)}</strong></span><span>Track <strong>{analysis.detections[0]?.track_id ?? '—'}</strong></span><span>Modo <strong>{analysis.mode}</strong></span><span>Validación <strong>{analysis.detections[0]?.validation || 'Sin detecciones'}</strong></span><span>Captura <strong>{formatMetric(analysis.metrics?.capture_fps, 'fps')}</strong></span><span>Presentación <strong>{formatMetric(analysis.metrics?.display_fps, 'fps')}</strong></span><span>Inferencia <strong>{formatMetric(analysis.metrics?.inference_hz, 'Hz')}</strong></span><span>Latencia p50 <strong>{formatMetric(analysis.metrics?.inference_ms_p50, 'ms')}</strong><small>{metricSampleLabel(analysis.metrics?.stages?.embed?.sample_count ?? analysis.metrics?.sample_count)}</small></span><span>Latencia p95 <strong>{formatMetric(analysis.metrics?.inference_ms_p95, 'ms')}</strong><small>{metricSampleLabel(analysis.metrics?.stages?.embed?.sample_count ?? analysis.metrics?.sample_count)}</small></span><span>VRAM <strong>{formatMetric(analysis.metrics?.vram_mb, 'MB', 'No disponible')}</strong></span><span>Backend → ACK <strong>{formatMetric(analysis.metrics?.capture_to_ack_ms, 'ms', analysis.simulated || analysis.arduino.simulated ? 'No disponible en simulación' : 'Sin muestras suficientes')}</strong></span>{Object.entries(analysis.metrics?.stages || analysis.metrics?.stage_ms || {}).map(([stage, metric]) => <span key={stage}>{stage} <strong>{formatMetric(metric?.p50_ms, 'ms')}</strong><small>{metricSampleLabel(metric?.sample_count)}</small></span>)}</div></section>}
+          <section className="panel settings-panel"><button className="panel-heading disclosure" onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen}><div><p className="eyebrow">Conexión</p><h2>Sesión y backend</h2></div><span aria-hidden="true">{settingsOpen ? '⌃' : '⌄'}</span></button>{settingsOpen && <div className="settings-body"><label>URL del backend<input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} disabled={Boolean(session)} placeholder="http://192.168.1.20:8000" /></label><label>ID de este teléfono<input value={deviceId} onChange={(e) => setDeviceId(e.target.value)} disabled={Boolean(session)} /></label><label>Rol de sesión<select value={requestedRole} onChange={(e) => setRequestedRole(e.target.value as 'controller' | 'reader' | 'admin')} disabled={Boolean(session)}><option value="controller">Controlador · cámara y Arduino</option><option value="reader">Lector · solo resultados</option><option value="admin">Administrador · configuración, calibración y hardware</option></select></label><label>{requestedRole === 'admin' ? 'Clave de administrador' : 'Clave de emparejamiento'}<input type="password" value={pairingKey} onChange={(e) => setPairingKey(e.target.value)} disabled={Boolean(session)} placeholder="Configurada en la laptop" /></label>{session ? <button className="button button-danger full" onClick={() => void release()}>Liberar sesión</button> : <button className="button button-accent full" onClick={() => void connect()} disabled={connection === 'checking' || !apiUrl}>{connection === 'checking' ? 'Verificando…' : 'Verificar y conectar'}</button>}{preview && session?.role === 'admin' && <button className="button button-secondary full" onClick={() => void (async () => { setCalibrating(true); setError(''); try { await calibrateBackground(apiUrl, session, preview.blob); const latest = await getConfig(apiUrl, session); mergeReferenceRefresh(latest); setLeaseMessage('Fondo vacío guardado para esta cámara.') } catch (caught) { setError(caught instanceof Error ? caught.message : 'No se pudo guardar el fondo') } finally { setCalibrating(false) } })()} disabled={calibrating}>{calibrating ? 'Guardando fondo…' : 'Usar foto actual como fondo vacío'}</button>}<div className="connection-note"><span className={`status-dot status-${connection}`} />{session ? session.role === 'admin' ? 'Sesión administrativa · Control total del sistema' : session.role === 'reader' ? 'Sesión lectora; no controla el Arduino' : 'Control exclusivo de este teléfono' : 'Sin sesión de control'}{status?.arduino?.simulated && <em>Arduino simulado</em>}</div>{inventory.length > 0 && <p className="inventory-note">{inventoryExample ? 'Inventario de ejemplo' : 'Inventario confirmado'}: {inventory.map((item, index) => item.name || item.location || `LED ${item.led_index ?? item.bit ?? index}`).join(' · ')}</p>}</div>}</section>
+        </aside>
+      </div>
+    )}
+
+    {activeTab === 'tools' && (
+      <ToolManager
+        apiUrl={apiUrl}
+        credentials={session}
+        config={config}
+        draftConfig={draftConfig}
+        onDraftChange={setDraftConfig}
+        onConfigUpdated={handleConfigUpdated}
+        onServerConfigRefreshed={mergeReferenceRefresh}
+        onNavigateTab={setActiveTab}
+      />
+    )}
+
+    {activeTab === 'calibration' && (
+      <CalibrationView
+        apiUrl={apiUrl}
+        credentials={session}
+        config={config}
+        draftConfig={draftConfig}
+        onDraftChange={setDraftConfig}
+        onConfigUpdated={handleConfigUpdated}
+        onServerConfigRefreshed={mergeReferenceRefresh}
+      />
+    )}
+
+    {activeTab === 'arduino' && (
+      <ArduinoPanel
+        apiUrl={apiUrl}
+        credentials={session}
+        config={config}
+        currentArduinoStatus={status?.arduino}
+        maintenanceMode={Boolean(status?.maintenance_mode)}
+        onMaintenanceChanged={(inMaintenance, arduino) => {
+          setStatus((prev) => prev ? {
+            ...prev,
+            maintenance_mode: inMaintenance,
+            arduino: arduino || prev.arduino,
+          } : prev)
+        }}
+        onStatusUpdated={(s) => setStatus((prev) => prev ? { ...prev, arduino: s } : { arduino: s })}
+      />
+    )}
+
+    {activeTab === 'system' && (
+      <SystemPanel
+        apiUrl={apiUrl}
+        credentials={session}
+        config={config}
+        task={configStatus?.task}
+        onConfigUpdated={handleConfigUpdated}
+        onNavigateTab={setActiveTab}
+      />
+    )}
+
     <footer><span>ToolLighthouse · análisis en laptop</span><span>Modo continuo requiere HTTPS o localhost · WebRTC queda preparado para una fase posterior</span></footer>
   </main>
 }

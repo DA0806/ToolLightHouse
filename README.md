@@ -28,12 +28,24 @@ En Linux/macOS, el mismo modo de desarrollo se prepara con `python3 -m venv .ven
 
 Abrir [dashboard local](http://127.0.0.1:8000/) en PC. Desde el teléfono usar `http://IP-DE-LAPTOP:8000/`, con ambos en la misma Wi-Fi privada. La interfaz solicita URL, clave y rol; un solo controlador opera la escena. Los demás pueden elegir lector. El selector **Elegir foto** permite cámara nativa donde el navegador lo soporte; cámara web/video requiere HTTPS confiable o localhost. Ver `docs/NETWORK.md` para firewall y HTTPS.
 
-1. Emparejar como controlador.
+1. Emparejar como controlador o administrador.
 2. En modo real, capturar bandeja vacía y guardar fondo con la misma resolución/orientación; mantener cámara fija cenital.
 3. Elegir una fotografía de herramientas separadas y analizarla.
 4. Revisar cajas, IDs, categorías/rechazos, ubicaciones y similitud coseno; no es porcentaje de confianza.
 5. Revisar estado solicitado y ACK confirmado. El modo mock y las luces simuladas aparecen identificados.
 6. Liberar control al terminar. Una escena o sesión vencida no debe reactivar LEDs mediante una inferencia anterior. Por defecto la foto conserva luces hasta 30 segundos y el video vence tras 2 segundos sin resultados frescos; estos tiempos son configurables.
+
+## Dashboard Web Mobile-First (5 Secciones)
+
+El frontend React móvil (`frontend/`) incluye navegación táctil inferior con controles cómodos (mínimo 44px) y soporte para escritorio:
+
+- **1. Inspección:** Captura fotográfica o cámara continua, visualización SVG con recuadros normalizados sobre la imagen, confirmación ACK de luces y métricas reales (latencia p50/p95).
+- **2. Herramientas:** 9 tarjetas editables y mapa físico 3×3; edición de nombre visible y nombre semántico IA; guía estructurada de rasgos visibles para zero-shot; intercambio atómico de LEDs sin duplicados; confirmación de inventario real; y carga/eliminación secuencial de fotos de referencia opcionales.
+- **3. Calibración:** Selector de modalidad (Solo Texto, Mejorar con fotos / Híbrido, Solo Imágenes); control deslizante de ponderación texto vs fotos (10% a 90%); captura del fondo de bandeja vacía (con visualización segura vía Blob autenticado); y definición interactiva o numérica de la Región de Interés (ROI).
+- **4. Arduino:** Detección de puertos COM o simulación en software; modo de mantenimiento con exclusión de inferencia para diagnósticos seguros; pruebas unitarias de LEDs individuales (D2..D10, $\le 3$s con temporizador y apagado automático); botón de apagado de emergencia (MASK:0); y guía paso a paso para programar `firmware/nano/nano.ino` en Arduino IDE.
+- **5. Sistema:** Asistente de 7 puntos de preparación con enlaces directos a cada sección; acción de un clic "Preparar IA"; conmutador entre modos `mock`, `preparation` y `real` (con desglose de bloqueadores pendientes); instrucciones en terminal para descarga de pesos; control de versiones, rollback ante fallos; y exportación/importación portable JSON sin filtrar secretos.
+
+Para detalles exhaustivos de la arquitectura y la guía paso a paso de uso desde el teléfono, consulta [docs/DASHBOARD_CONFIGURATION.md](docs/DASHBOARD_CONFIGURATION.md).
 
 ## Modos
 
