@@ -41,6 +41,19 @@ Segmentación multiobjeto, máscaras/ROI y dimensiones; asociación global de tr
 - Quedan avisos de deprecación de FastAPI/Starlette y un aviso `act(...)` de test React; las pruebas y builds pasan. No se ocultaron ni se presentan como fallos físicos.
 
 ## Estado de entrega
-Código y Git local preparados, sin commits, remotos ni push. `.gitignore` excluye pesos, entornos, cachés, fotos privadas, calibración y secretos. La herramienta AGY no pudo ejecutar por un hook global de telemetría mal configurado; el trabajo de implementación/revisión continuó con agentes Codex sin editar esa configuración global.
+Al finalizar la implementación inicial del 13 de octubre aún no había commits, remotos ni push. Posteriormente el usuario autorizó la publicación en `DA0806/ToolLightHouse`. `.gitignore` excluye pesos, entornos, cachés, fotos privadas, calibración y secretos. La herramienta AGY no pudo ejecutar por un hook global de telemetría mal configurado; el trabajo de implementación/revisión continuó con agentes Codex sin editar esa configuración global.
+
+## Corrección zero-shot del 14 de octubre de 2026
+
+La galería predeterminada es `text-only`: nombres y múltiples descripciones por cada uno de los nueve IDs del inventario. `image-only` e `hybrid` quedan disponibles con referencias opcionales. Los cachés de la receta anterior se deben reconstruir. Los límites de rechazo se calibran por modalidad; no se presentan como confianza porcentual.
+
+- Backend CPU sin Torch: **108 tests aprobados, 1 smoke GPU opcional omitido, 105 avisos deprecados de FastAPI/Starlette**. Incluye galería textual sin fotografías, las tres modalidades, mezcla normalizada, límites/perfiles, CLI, descarga con firma restringida de Hugging Face y caché invalidado por nombres/texto/modo/contenido de modelo/altas y bajas de referencias. Mock no lee una galería configurada ni su modelo.
+- Frontend: **15 tests aprobados** y build/typecheck React correctos. No se modificó el contrato de resultados/cajas, sesiones ni Arduino.
+- HTTP/WebSocket mock: servidor Uvicorn en puerto loopback temporal, fondo y clave de fixture aislados; 0/1/2/3/5/9 objetos, cajas/máscaras concordantes, segundo controlador rechazado y eventos system/detection/arduino_ack aprobados. Torch no se importó. El servidor temporal y sus sesiones terminaron al completar la prueba.
+- CUDA real en la RTX 3060 de desarrollo: `build-gallery --mode real --device cuda --inventory config/inventory.example.json --references .tools/absent-reference-dir --output .tools/gallery-text.json` creó **9 prototipos textuales, 9 prompts y 0 imágenes**. Los nombres/descripciones usados son placeholders, no el inventario real.
+- Smoke del pipeline imagen → texto: rectángulo sintético, galería textual y EmbeddingGemma 2 local; un recorte produjo top1/top2/margen finitos y máscara 0 con ACK simulado. Se usó un umbral de fixture .9999 para comprobar rechazo, sin medir precisión ni calibrar los límites de producción.
+- Entorno AI inspeccionado: Torch 2.11.0+cu128, Torchvision 0.26.0+cu128, Sentence Transformers 6.1.0, Transformers 5.19.0 y huggingface_hub 1.33.0; `pip check` sin dependencias rotas. `download-model` ya no usa `local_dir_use_symlinks`; se verificó la firma instalada y un spy con sólo los argumentos admitidos, sin repetir la descarga de pesos existentes.
+
+No se evaluó la precisión zero-shot de las nueve herramientas reales ni la laptop RTX 4060/5050 final, teléfono/Wi-Fi o Nano físico. `DATA.md` explica cómo ajustar perfiles con fotografías reales de calibración y medir el resultado con evaluación reservada. Fotos de referencia de herramientas no son un requisito de `text-only`; las fotos de fondo y evaluación tienen otra finalidad.
 
 Para la prueba final seguir `DEPLOY_RTX4060.md`/`DEPLOY_RTX5050.md`, `COMMANDS.md`, `NETWORK.md`, `HARDWARE.md` y la lista `ACCEPTANCE.md`. El servidor de verificación y su sesión se detuvieron; arrancar el servidor con una clave propia para seguir desarrollando.

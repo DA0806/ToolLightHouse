@@ -12,7 +12,8 @@ models/*
 data/references/*
 data/evaluation/*
 data/gallery-cache*
-data/gallery.json
+data/gallery*.json
+data/*-report.json
 data/*.npz
 samples/*
 !samples/README.md
@@ -24,6 +25,8 @@ samples/*
 certificates/
 secrets/
 .local/
+config/settings.json
+config/inventory.json
 data/calibration/
 data/private/
 data/cache/

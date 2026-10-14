@@ -16,6 +16,17 @@ class ToolCategory:
     pin: int
     descriptions: tuple[str, ...] = ()
 
+    def __post_init__(self):
+        if not isinstance(self.class_id, str) or not self.class_id.strip():
+            raise ValueError("class_id must be a non-empty string")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("name must be a non-empty string")
+        if not isinstance(self.descriptions, (list, tuple)):
+            raise ValueError("descriptions must be a list or tuple of strings")
+        if any(not isinstance(description, str) or not description.strip() for description in self.descriptions):
+            raise ValueError("descriptions must contain non-empty strings")
+        object.__setattr__(self, "descriptions", tuple(self.descriptions))
+
 
 class Inventory:
     def __init__(self, categories: list[ToolCategory], example: bool = False):
@@ -37,7 +48,7 @@ class Inventory:
     @classmethod
     def from_file(cls, path: str | Path) -> "Inventory":
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls([ToolCategory(c["class_id"], c["name"], c.get("location", "unconfirmed"), c["led_index"], c["pin"], tuple(c.get("descriptions", ()))) for c in raw["categories"]], example=bool(raw.get("example", False)))
+        return cls([ToolCategory(c["class_id"], c["name"], c.get("location", "unconfirmed"), c["led_index"], c["pin"], c.get("descriptions", ())) for c in raw["categories"]], example=bool(raw.get("example", False)))
 
 
 @dataclass
@@ -63,7 +74,9 @@ class Settings:
     tracking_max_missed: int = 8
     classifier_threshold: float = 0.72
     classifier_margin: float = 0.08
-    text_weight: float = 0.0
+    classifier_profiles: dict[str, dict[str, float]] = field(default_factory=dict)
+    gallery_mode: str = "text-only"
+    text_weight: float = 0.5
     background_path: str | None = "data/calibration/background.png"
     roi_path: str | None = "data/calibration/roi.json"
     roi: tuple[int, int, int, int] | None = None
@@ -82,8 +95,29 @@ class Settings:
             raise ValueError("mode must be 'mock' or 'real'")
         if self.device not in {"auto", "cpu", "cuda"} and not self.device.startswith("cuda:"):
             raise ValueError("device must be auto, cpu, cuda, or cuda:N")
-        if not 0 <= self.classifier_threshold <= 1 or not 0 <= self.classifier_margin <= 1:
-            raise ValueError("classifier threshold and margin must be between 0 and 1")
+        if self.gallery_mode not in {"text-only", "image-only", "hybrid"}:
+            raise ValueError("gallery_mode must be text-only, image-only, or hybrid")
+        if not math.isfinite(float(self.classifier_threshold)) or not -1 <= self.classifier_threshold <= 1:
+            raise ValueError("classifier threshold must be finite and between -1 and 1")
+        if not math.isfinite(float(self.classifier_margin)) or not 0 <= self.classifier_margin <= 2:
+            raise ValueError("classifier margin must be finite and between 0 and 2")
+        if not math.isfinite(float(self.text_weight)) or not 0 <= self.text_weight <= 1:
+            raise ValueError("text_weight must be finite and between 0 and 1")
+        if self.gallery_mode == "hybrid" and not 0 < self.text_weight < 1:
+            raise ValueError("hybrid text_weight must be strictly between 0 and 1")
+        if not isinstance(self.classifier_profiles, dict):
+            raise ValueError("classifier_profiles must be a mapping")
+        for mode, profile in self.classifier_profiles.items():
+            if mode not in {"text-only", "image-only", "hybrid"} or not isinstance(profile, dict):
+                raise ValueError("classifier_profiles keys must be gallery modes and values must be mappings")
+            if set(profile) - {"threshold", "margin"}:
+                raise ValueError("classifier profiles support only threshold and margin")
+            threshold = profile.get("threshold", self.classifier_threshold)
+            margin = profile.get("margin", self.classifier_margin)
+            if not math.isfinite(float(threshold)) or not -1 <= float(threshold) <= 1:
+                raise ValueError("profile threshold must be finite and between -1 and 1")
+            if not math.isfinite(float(margin)) or not 0 <= float(margin) <= 2:
+                raise ValueError("profile margin must be finite and between 0 and 2")
         if self.prediction_max_age_seconds <= 0 or self.prediction_interval_seconds < 0 or self.batch_size <= 0:
             raise ValueError("prediction ages/interval and batch_size must be positive")
         if self.roi is not None and (len(self.roi) != 4 or any(int(v) < 0 for v in self.roi) or int(self.roi[2]) <= 0 or int(self.roi[3]) <= 0):
@@ -108,3 +142,10 @@ class Settings:
             inventory_path = Path(settings.inventory_path)
             settings.inventory = Inventory.from_file(inventory_path if inventory_path.is_absolute() else config_path.parent / inventory_path)
         return settings
+
+    def classifier_parameters(self) -> tuple[float, float]:
+        profile = self.classifier_profiles.get(self.gallery_mode, {})
+        return (
+            float(profile.get("threshold", self.classifier_threshold)),
+            float(profile.get("margin", self.classifier_margin)),
+        )

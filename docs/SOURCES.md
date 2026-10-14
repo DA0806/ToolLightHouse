@@ -11,3 +11,5 @@ Consultadas el 13 de octubre de 2026, junto a los dos prompts del usuario:
 - [Arduino: pinout Nano](https://content.arduino.cc/assets/Pinout-NANO_latest.pdf): pines y corriente por I/O.
 
 No se editó Notion ni se publicaron resultados allí. Su estado de diseño no se toma como evidencia de hardware funcionando. Las versiones usadas en esta máquina se registran separadamente en el reporte de validación.
+
+Revisión del 14 de octubre: la guía multimodal de Google y el [model card de EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) describen un espacio compartido imagen/texto y comparación de imágenes con textos mediante coseno. Se adopta una galería `text-only` zero-shot predeterminada con ensemble de descripciones por clase; esto es una decisión de implementación, no evidencia de precisión del inventario de herramientas. La firma de `snapshot_download` se inspeccionó en `huggingface_hub 1.33.0`: admite `repo_id` y `local_dir`, y no admite el argumento retirado `local_dir_use_symlinks`.

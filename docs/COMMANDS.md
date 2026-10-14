@@ -15,8 +15,9 @@ The CLI exposes the complete local workflow:
    the configured calibration files.
 4. `download-model` — download `google/embeddinggemma-2` explicitly with
    `huggingface_hub`; install the optional AI dependencies first.
-5. `build-gallery` — encode grouped reference images and write the validated
-   gallery cache with its fingerprint and preprocessing manifest.
+5. `build-gallery` — build the default `text-only` gallery from the nine inventory
+   names/descriptions, without reference images. `image-only` and `hybrid` are
+   optional modes requiring photographs for all nine classes.
 6. `test-model` — run finite image and text embedding smoke checks.
 7. `test-leds` — exercise `MASK:0`, `MASK:511`, and `MASK:0` with simulator or
    confirmed physical inventory. It always sends a final zero mask and closes.
@@ -39,7 +40,7 @@ Examples:
 .\.venv\Scripts\python.exe -m toollighthouse test-camera --scan
 .\.venv\Scripts\python.exe -m toollighthouse calibrate --camera 0 --headless --max-frames 1
 .\.venv\Scripts\python.exe -m toollighthouse download-model --model-path models/embeddinggemma-2
-.\.venv\Scripts\python.exe -m toollighthouse build-gallery --references data/references --output data/gallery.json --mode real
+.\.venv\Scripts\python.exe -m toollighthouse build-gallery --inventory config/inventory.json --output data/gallery.json --mode real --device cuda
 .\.venv\Scripts\python.exe -m toollighthouse test-model --device cuda --model-path models/embeddinggemma-2
 .\.venv\Scripts\python.exe -m toollighthouse test-leds --simulate-leds
 .\.venv\Scripts\python.exe -m toollighthouse run --mode mock --simulate-leds --camera 0 --headless --max-frames 100
@@ -56,16 +57,47 @@ serial port. For a public deployment, put TLS in a reverse proxy or run
 Uvicorn with an application factory and certificate options; the local CLI
 does not silently create HTTPS certificates.
 
-The gallery fingerprint includes reference bytes, descriptions, text weight,
-model identity and preprocessing. Rebuild it after any of those inputs change.
+The default `--gallery-mode text-only` uses each inventory name and its independent
+`descriptions` strings. It averages normalized vectors by class and normalizes
+the resulting prototype. Names work as fallback when descriptions are empty,
+but the example inventory remains a template and is not an evaluated set of tools.
+No model training or reference-photo folders are required in this mode. Captured
+image crops are still embedded through the vision encoder and compared by cosine.
 
-For real vision with simulated lights, after calibration and building all nine
-reference classes:
+The gallery fingerprint includes inventory IDs/names/descriptions, mode, ensemble
+recipe, model contents and preprocessing; reference images are included only for
+image/hybrid modes. Rebuild after changing these inputs. Old caches are rejected.
+Changing only classification thresholds/margins does not require a rebuild.
+
+Optional photographic galleries (same mode must be selected when running):
 
 ```powershell
-.\.venv\Scripts\python.exe -m toollighthouse serve --mode real --device cuda --gallery data/gallery.json --simulate-leds --host 0.0.0.0 --port 8000
-.\.venv\Scripts\python.exe -m toollighthouse run --mode real --device cuda --gallery data/gallery.json --video demo.mp4 --simulate-leds
-.\.venv\Scripts\python.exe -m toollighthouse run --mode real --device cuda --gallery data/gallery.json --camera 'http://192.168.1.30:8080/video' --simulate-leds
+.\.venv\Scripts\python.exe -m toollighthouse build-gallery --mode real --device cuda --gallery-mode image-only --inventory config/inventory.json --references data/references --output data/gallery-image.json
+.\.venv\Scripts\python.exe -m toollighthouse build-gallery --mode real --device cuda --gallery-mode hybrid --text-weight 0.5 --inventory config/inventory.json --references data/references --output data/gallery-hybrid.json
+```
+
+Image folders must match the nine configured `class_id` values, with at least one
+photo per class and no extra classes. Hybrid combines normalized image and text
+prototypes with `text_weight` strictly between 0 and 1 (default 0.5).
+
+`classifier_profiles` maps `text-only`, `image-only`, `hybrid` to independently
+configurable `threshold`/`margin` values. CLI `--classifier-threshold` and
+`--classifier-margin` override the active mode's limits; global fields remain
+fallbacks. Example values .72/.08 are uncalibrated. See `DATA.md` for known/unknown
+calibration, held-out evaluation and full-scene segmentation checks. Cosine scores
+are not percentages of confidence. Example calibration command:
+
+```powershell
+.\.venv\Scripts\python.exe -m toollighthouse evaluate --config config/settings.json --mode real --device cuda --gallery-mode text-only --inventory config/inventory.json --gallery data/gallery.json --references data/calibration --classifier-threshold 0.55 --classifier-margin 0.04 --output data/calibration-report.json
+```
+
+For real zero-shot vision with simulated lights, after completing the inventory,
+building its textual gallery and saving a calibrated empty-tray background:
+
+```powershell
+.\.venv\Scripts\python.exe -m toollighthouse serve --mode real --device cuda --inventory config/inventory.json --gallery data/gallery.json --simulate-leds --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python.exe -m toollighthouse run --mode real --device cuda --inventory config/inventory.json --gallery data/gallery.json --video demo.mp4 --simulate-leds
+.\.venv\Scripts\python.exe -m toollighthouse run --mode real --device cuda --inventory config/inventory.json --gallery data/gallery.json --camera 'http://192.168.1.30:8080/video' --simulate-leds
 ```
 
 Copy the example inventory to a separate file, replace the nine provisional

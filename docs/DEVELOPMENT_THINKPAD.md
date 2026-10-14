@@ -27,4 +27,6 @@ El código original `probar_gemma.py`, pesos locales y `samples/objeto.jpg` se c
 | Hardware | `serial_transport.py`, `led_controller.py`, `firmware/nano` |
 | App/API | `api/`, `frontend/src/`, tests de integración |
 
-Coordinar contratos antes de editar `pipeline.py`/API. Mantener datos privados separados de código. Para transferir a GitHub revisar `.gitignore`, archivos visibles en `git status`, y no añadir `.venv`, `models`, imágenes privadas, cachés, tokens ni certificados. El Git local no tiene commits/remoto todavía; publicación y destino se deciden después.
+Coordinar contratos antes de editar `pipeline.py`/API. Mantener datos privados separados de código. Para transferir a GitHub revisar `.gitignore`, archivos visibles en `git status`, y no añadir `.venv`, `models`, imágenes privadas, cachés, tokens ni certificados. El repositorio del equipo es `https://github.com/DA0806/ToolLightHouse`; cada laptop conserva su propio entorno/modelo y datos privados.
+
+Para IA real seguir `DEPLOY_RTX5050.md` (también 4060). El flujo predeterminado construye `text-only` desde nombres/descripciones del inventario sin fotos de referencia ni entrenamiento. Las fotos reales de calibración/evaluación sirven para ajustar límites por modalidad y medir precisión; el fondo de bandeja sigue siendo obligatorio para segmentación. `image-only`/`hybrid` conservan referencias fotográficas opcionales.

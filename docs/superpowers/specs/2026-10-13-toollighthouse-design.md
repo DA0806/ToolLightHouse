@@ -24,3 +24,7 @@ Tests sintéticos para 0/1/2/3/5/9 objetos y duplicados; tracking y vencimiento;
 
 ## Entrega y límites
 README PowerShell, guías desarrollo/laptop RTX4060/5050, red Wi-Fi/firewall/HTTPS, firmware/corriente, calibración/referencias/evaluación, reporte verificaciones. Preparar `.gitignore` y CI sin pesos, datasets, secretos ni entornos. No publicar, commit o push: la petición indica transferencia futura a GitHub sin un repositorio destino actual. Nombres reales, ajuste de umbrales, cámara fija, precisión, rendimiento GPU y circuito siguen pendientes de validación con equipo real.
+
+## Nota de vigencia
+
+Este diseño registra la implementación inicial del 13 de octubre. El cambio autorizado del 14 de octubre sustituye la galería imagen-imagen predeterminada por `text-only` zero-shot sin fotos de referencia; `image-only`/`hybrid` quedan opcionales. El repositorio ya fue publicado y el usuario autorizó commit/push de esa corrección. El flujo vigente está en README, COMMANDS y DATA; las decisiones originales anteriores se conservan como historial.

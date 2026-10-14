@@ -2,14 +2,14 @@
   "description": "Example only; replace names and locations after physical inventory confirmation.",
   "example": true,
   "categories": [
-    {"class_id": "tool_1", "name": "Tool 1", "location": "unconfirmed", "led_index": 0, "pin": 2},
-    {"class_id": "tool_2", "name": "Tool 2", "location": "unconfirmed", "led_index": 1, "pin": 3},
-    {"class_id": "tool_3", "name": "Tool 3", "location": "unconfirmed", "led_index": 2, "pin": 4},
-    {"class_id": "tool_4", "name": "Tool 4", "location": "unconfirmed", "led_index": 3, "pin": 5},
-    {"class_id": "tool_5", "name": "Tool 5", "location": "unconfirmed", "led_index": 4, "pin": 6},
-    {"class_id": "tool_6", "name": "Tool 6", "location": "unconfirmed", "led_index": 5, "pin": 7},
-    {"class_id": "tool_7", "name": "Tool 7", "location": "unconfirmed", "led_index": 6, "pin": 8},
-    {"class_id": "tool_8", "name": "Tool 8", "location": "unconfirmed", "led_index": 7, "pin": 9},
-    {"class_id": "tool_9", "name": "Tool 9", "location": "unconfirmed", "led_index": 8, "pin": 10}
+    {"class_id": "tool_1", "name": "Tool 1", "descriptions": ["Describe the tool's visual shape and use."], "location": "unconfirmed", "led_index": 0, "pin": 2},
+    {"class_id": "tool_2", "name": "Tool 2", "descriptions": ["Describe the tool's visual shape and use."], "location": "unconfirmed", "led_index": 1, "pin": 3},
+    {"class_id": "tool_3", "name": "Tool 3", "descriptions": ["Describe the tool's visual shape and use."], "location": "unconfirmed", "led_index": 2, "pin": 4},
+    {"class_id": "tool_4", "name": "Tool 4", "descriptions": ["Describe the tool's visual shape and use."], "location": "unconfirmed", "led_index": 3, "pin": 5},
+    {"class_id": "tool_5", "name": "Tool 5", "descriptions": ["Describe the tool's visual shape and use."], "location": "unconfirmed", "led_index": 4, "pin": 6},
+    {"class_id": "tool_6", "name": "Tool 6", "descriptions": ["Describe the tool's visual shape and use."], "location": "unconfirmed", "led_index": 5, "pin": 7},
+    {"class_id": "tool_7", "name": "Tool 7", "descriptions": ["Describe the tool's visual shape and use."], "location": "unconfirmed", "led_index": 6, "pin": 8},
+    {"class_id": "tool_8", "name": "Tool 8", "descriptions": ["Describe the tool's visual shape and use."], "location": "unconfirmed", "led_index": 7, "pin": 9},
+    {"class_id": "tool_9", "name": "Tool 9", "descriptions": ["Describe the tool's visual shape and use."], "location": "unconfirmed", "led_index": 8, "pin": 10}
   ]
 }

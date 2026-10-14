@@ -62,6 +62,9 @@ def main(argv=None):
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--gallery")
     parser.add_argument("--text-weight", type=float, default=None)
+    parser.add_argument("--gallery-mode", choices=["text-only", "image-only", "hybrid"], default=None)
+    parser.add_argument("--classifier-threshold", type=float, default=None)
+    parser.add_argument("--classifier-margin", type=float, default=None)
     parser.add_argument("--class-id")
     parser.add_argument("--references")
     parser.add_argument("--image")
@@ -92,6 +95,16 @@ def main(argv=None):
         if not 0.0 <= args.text_weight <= 1.0:
             raise SystemExit("--text-weight must be between 0 and 1")
         settings.text_weight = args.text_weight
+    if args.gallery_mode is not None:
+        settings.gallery_mode = args.gallery_mode
+    if args.classifier_threshold is not None:
+        settings.classifier_threshold = args.classifier_threshold
+    if args.classifier_margin is not None:
+        settings.classifier_margin = args.classifier_margin
+    if args.classifier_threshold is not None or args.classifier_margin is not None:
+        threshold, margin = settings.classifier_parameters()
+        settings.classifier_profiles = {**settings.classifier_profiles, settings.gallery_mode: {"threshold": args.classifier_threshold if args.classifier_threshold is not None else threshold, "margin": args.classifier_margin if args.classifier_margin is not None else margin}}
+    settings.__post_init__()
     if args.confirm_inventory:
         settings.inventory_confirmed = True
     if args.inventory:
@@ -129,6 +142,8 @@ def main(argv=None):
             "sentence_transformers": None,
             "transformers": None,
             "torch": None,
+            "torchvision": None,
+            "huggingface_hub": None,
         }
         try:
             import cv2
@@ -136,7 +151,7 @@ def main(argv=None):
         except ImportError:
             report["opencv"] = None
         from importlib.metadata import PackageNotFoundError, version
-        for distribution, key in (("fastapi", "fastapi"), ("pyserial", "pyserial"), ("sentence-transformers", "sentence_transformers"), ("transformers", "transformers"), ("torch", "torch")):
+        for distribution, key in (("fastapi", "fastapi"), ("pyserial", "pyserial"), ("sentence-transformers", "sentence_transformers"), ("transformers", "transformers"), ("torch", "torch"), ("torchvision", "torchvision"), ("huggingface-hub", "huggingface_hub")):
             try:
                 report[key] = version(distribution)
             except PackageNotFoundError:
@@ -337,8 +352,8 @@ def main(argv=None):
         try:
             from huggingface_hub import snapshot_download
         except ImportError as exc:
-            raise SystemExit("install huggingface_hub explicitly to download the model") from exc
-        snapshot_download("google/embeddinggemma-2", local_dir=settings.model_path, local_dir_use_symlinks=False)
+            raise SystemExit("install the AI dependencies with: python -m pip install -e '.[ai]'") from exc
+        snapshot_download(repo_id="google/embeddinggemma-2", local_dir=settings.model_path)
         print(f"Downloaded google/embeddinggemma-2 to {settings.model_path}")
         return 0
     if args.command == "test-model":
@@ -355,37 +370,26 @@ def main(argv=None):
         return 0
     if args.command == "build-gallery":
         from pathlib import Path
-        from PIL import Image
-        import numpy as np
         from .embeddings import EmbeddingEngine, references_fingerprint
-        from .gallery import Gallery
+        from .gallery import build_gallery
+        mode = settings.gallery_mode
         root = Path(args.references or "data/references")
-        files = sorted(p for p in root.rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"})
-        if not files:
+        files = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}) if mode in {"image-only", "hybrid"} else []
+        if mode in {"image-only", "hybrid"} and not files:
             raise SystemExit(f"no reference images found under {root}")
         engine = EmbeddingEngine(settings.model_path, None if settings.device == "auto" else settings.device)
-        vectors = engine.encode_images([Image.open(path).convert("RGB") for path in files])
-        refs = {}
-        for path, vector in zip(files, vectors):
-            refs.setdefault(path.parent.name, []).append(vector)
-        image_refs = {key: np.mean(value, axis=0) for key, value in refs.items()}
-        expected_ids = {category.class_id for category in settings.inventory.categories}
-        if set(image_refs) != expected_ids:
-            missing = sorted(expected_ids - set(image_refs)); extra = sorted(set(image_refs) - expected_ids)
-            raise SystemExit(f"gallery must contain exactly the configured nine classes; missing={missing} extra={extra}")
-        if settings.text_weight:
-            descriptions = ["; ".join(category.descriptions) for category in settings.inventory.categories if category.class_id in image_refs and category.descriptions]
-            ids = [category.class_id for category in settings.inventory.categories if category.class_id in image_refs and category.descriptions]
-            if descriptions:
-                text_vectors = engine.encode_text(descriptions)
-                for class_id, text_vector in zip(ids, text_vectors):
-                    image_refs[class_id] = (1 - settings.text_weight) * image_refs[class_id] + settings.text_weight * text_vector
-        gallery = Gallery(image_refs)
+        try:
+            gallery, manifest = build_gallery(engine, settings.inventory, mode=mode, image_paths=files, text_weight=settings.text_weight)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         output = args.output or "data/gallery.json"
         descriptions = {c.class_id: list(c.descriptions) for c in settings.inventory.categories}
-        fingerprint = references_fingerprint(files, settings.model_path, descriptions=descriptions, text_weight=settings.text_weight, model_identity=str(Path(settings.model_path).resolve()))
-        gallery.save(output, fingerprint, manifest={"paths": [str(p) for p in files], "descriptions": descriptions, "text_weight": settings.text_weight, "model_path": str(Path(settings.model_path).resolve()), "preprocessing": "rgb-pil-v1"})
-        print(json.dumps({"output": output, "classes": sorted(refs), "images": len(files)}))
+        names = {c.class_id: c.name for c in settings.inventory.categories}
+        ids = {c.class_id for c in settings.inventory.categories}
+        manifest.update({"paths": [str(p) for p in files], "references_root": str(root), "model_path": str(Path(settings.model_path).resolve())})
+        fingerprint = references_fingerprint(files, settings.model_path, descriptions=descriptions, names=names, text_weight=settings.text_weight, model_identity=str(Path(settings.model_path).resolve()), preprocessing=manifest["preprocessing"], gallery_mode=mode, inventory_ids=ids)
+        gallery.save(output, fingerprint, manifest=manifest)
+        print(json.dumps({"output": output, "classes": sorted(ids), "images": len(files), "text_prompts": manifest["text_count"], "gallery_mode": mode, "threshold": settings.classifier_parameters()[0], "margin": settings.classifier_parameters()[1]}))
         return 0
     if args.command == "capture-reference":
         if not args.class_id or not args.output:
@@ -450,21 +454,23 @@ def main(argv=None):
     if args.command == "evaluate":
         from pathlib import Path
         from PIL import Image
-        import numpy as np
         from .embeddings import EmbeddingEngine
-        from .gallery import Gallery
+        from .gallery import load_validated_gallery
         from .classifier import SimilarityClassifier
         root = Path(args.references or "data/evaluation")
         gallery_path = args.gallery or "data/gallery.json"
-        files = sorted(p for p in root.rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"})
+        files = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"})
         if not files or not Path(gallery_path).exists():
             raise SystemExit("evaluate requires evaluation images grouped by class and a built --gallery")
         import json as json_module
-        payload = json_module.loads(Path(gallery_path).read_text(encoding="utf-8"))
-        gallery = Gallery.load(gallery_path, payload["fingerprint"])
+        try:
+            gallery = load_validated_gallery(gallery_path, inventory=settings.inventory, model_path=settings.model_path, gallery_mode=settings.gallery_mode, text_weight=settings.text_weight)
+        except (OSError, ValueError, KeyError) as exc:
+            raise SystemExit(f"gallery cache is unavailable or stale; rebuild it: {exc}") from exc
         engine = EmbeddingEngine(settings.model_path, None if settings.device == "auto" else settings.device)
         vectors = engine.encode_images([Image.open(path).convert("RGB") for path in files])
-        classifier = SimilarityClassifier(gallery.references, settings.classifier_threshold, settings.classifier_margin)
+        threshold, margin = settings.classifier_parameters()
+        classifier = SimilarityClassifier(gallery.references, threshold, margin, gallery_mode=settings.gallery_mode)
         predictions = [classifier.predict(vector, index + 1) for index, vector in enumerate(vectors)]
         labels = sorted(gallery.references)
         known_pairs = [(prediction, path) for prediction, path in zip(predictions, files) if path.parent.name in gallery.references]
@@ -474,7 +480,7 @@ def main(argv=None):
         for prediction, path in known_pairs:
             confusion[path.parent.name][prediction.class_id or "unknown"] += 1
         false_accepts = sum(prediction.class_id is not None for prediction, _ in unknown_pairs)
-        report = {"images": len(files), "known_images": len(known_pairs), "unknown_images": len(unknown_pairs), "correct": correct, "accuracy": correct / len(known_pairs) if known_pairs else None, "unknown_rejections": sum(prediction.class_id is None for prediction, _ in unknown_pairs), "false_accept_rate": false_accepts / len(unknown_pairs) if unknown_pairs else None, "confusion": confusion}
+        report = {"images": len(files), "known_images": len(known_pairs), "unknown_images": len(unknown_pairs), "correct": correct, "accuracy": correct / len(known_pairs) if known_pairs else None, "unknown_rejections": sum(prediction.class_id is None for prediction, _ in unknown_pairs), "false_accept_rate": false_accepts / len(unknown_pairs) if unknown_pairs else None, "confusion": confusion, "gallery_mode": settings.gallery_mode, "threshold": threshold, "margin": margin, "samples": [{"file": str(path), "expected": path.parent.name, "top1": prediction.class_id, "similarity_top1": prediction.similarity_top1, "similarity_top2": prediction.similarity_top2, "margin": prediction.margin, "validation": prediction.validation} for prediction, path in zip(predictions, files)]}
         if args.output:
             Path(args.output).write_text(json_module.dumps(report, indent=2), encoding="utf-8")
         print(json.dumps(report))

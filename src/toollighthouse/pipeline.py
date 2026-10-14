@@ -13,7 +13,7 @@ import cv2
 from .classifier import MockClassifier, SimilarityClassifier
 from .config import Settings
 from .embeddings import EmbeddingEngine
-from .gallery import Gallery
+from .gallery import load_validated_gallery
 from .led_controller import mask_for_detections
 from .metrics import Metrics
 from .segmentation import Segmenter
@@ -49,24 +49,15 @@ class Pipeline:
         self.serial = serial or SimulatedSerial()
         self.embedder = embedder or (EmbeddingEngine(self.settings.model_path, self.settings.device if self.settings.device != "auto" else None) if self.settings.mode == "real" else None)
         references = {}
-        if self.settings.gallery_path:
+        if self.settings.mode == "real" and self.settings.gallery_path:
             try:
-                import json
-                with open(self.settings.gallery_path, encoding="utf-8") as handle:
-                    payload = json.load(handle)
-                manifest = payload.get("manifest") or {}
-                from .embeddings import references_fingerprint
-                paths = manifest.get("paths") or []
-                current_descriptions = {c.class_id: list(c.descriptions) for c in self.settings.inventory.categories}
-                if manifest.get("descriptions", {}) != current_descriptions or float(manifest.get("text_weight", 0.0)) != float(self.settings.text_weight):
-                    raise ValueError("gallery recipe differs from current inventory descriptions or text_weight; rebuild it")
-                if manifest.get("preprocessing") not in (None, "rgb-pil-v1"):
-                    raise ValueError("gallery preprocessing recipe is unsupported; rebuild it")
-                expected_ids = {c.class_id for c in self.settings.inventory.categories}
-                if set(payload.get("references", {})) - expected_ids:
-                    raise ValueError("gallery contains classes absent from the configured inventory")
-                fingerprint = references_fingerprint(paths, self.settings.model_path, descriptions=current_descriptions, text_weight=self.settings.text_weight, model_identity=str(Path(self.settings.model_path).resolve()))
-                references = Gallery.load(self.settings.gallery_path, fingerprint).references
+                references = load_validated_gallery(
+                    self.settings.gallery_path,
+                    inventory=self.settings.inventory,
+                    model_path=self.settings.model_path,
+                    gallery_mode=self.settings.gallery_mode,
+                    text_weight=self.settings.text_weight,
+                ).references
             except (FileNotFoundError, ValueError, KeyError) as exc:
                 if self.settings.mode == "real":
                     raise RuntimeError(f"real mode gallery unavailable or stale: {self.settings.gallery_path}; rebuild it before starting") from exc
@@ -75,7 +66,8 @@ class Pipeline:
             raise RuntimeError("real mode requires gallery_path with a validated gallery cache")
         if self.settings.mode == "real" and not references:
             raise RuntimeError("real mode gallery contains no references")
-        self.classifier = MockClassifier([c.class_id for c in self.settings.inventory.categories]) if self.settings.mode == "mock" else SimilarityClassifier(references, self.settings.classifier_threshold, self.settings.classifier_margin)
+        threshold, margin = self.settings.classifier_parameters()
+        self.classifier = MockClassifier([c.class_id for c in self.settings.inventory.categories]) if self.settings.mode == "mock" else SimilarityClassifier(references, threshold, margin, gallery_mode=self.settings.gallery_mode)
         self._prediction_cache = {}
 
     def reset_scene(self):

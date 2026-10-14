@@ -9,7 +9,7 @@ Para conocer IPv4 en Windows:
 ```powershell
 Get-NetIPConfiguration
 ```
-Usar la IPv4 de la interfaz Wi-Fi activa, no direcciones de adaptadores virtuales. Backend debe escuchar `0.0.0.0`; el teléfono usa la IPv4 concreta. El backend puede arrancar offline si los pesos, referencias, caché y build ya están instalados.
+Usar la IPv4 de la interfaz Wi-Fi activa, no direcciones de adaptadores virtuales. Backend debe escuchar `0.0.0.0`; el teléfono usa la IPv4 concreta. El backend puede arrancar offline si los pesos, inventario textual, galería y build ya están instalados. Fotos de referencia sólo son necesarias para `image-only`/`hybrid`.
 
 ## Firewall Windows
 En PowerShell **administrador** de la laptop de demostración, crear una regla limitada a red privada y subred local:

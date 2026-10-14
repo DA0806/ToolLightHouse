@@ -9,7 +9,13 @@
   "inventory_confirmed": false,
   "device": "auto",
   "model_path": "models/embeddinggemma-2",
-  "text_weight": 0.0,
+  "text_weight": 0.5,
+  "gallery_mode": "text-only",
+  "classifier_profiles": {
+    "text-only": {"threshold": 0.72, "margin": 0.08},
+    "image-only": {"threshold": 0.72, "margin": 0.08},
+    "hybrid": {"threshold": 0.72, "margin": 0.08}
+  },
   "batch_size": 9,
   "frame_max_age_seconds": 1.0,
   "prediction_max_age_seconds": 1.0,

@@ -58,9 +58,48 @@ class EmbeddingEngine:
         return values
 
 
-def references_fingerprint(paths: list[str | Path], config: str = "", *, descriptions=None, text_weight: float = 0.0, model_identity: str = "", preprocessing: str = "rgb-pil-v1") -> str:
+def _model_content_identity(model_identity: str) -> str:
+    """Hash local model files in chunks so cache identity includes model content."""
+    root = Path(model_identity)
+    digest = hashlib.sha256()
+    if not root.exists():
+        digest.update(f"missing:{model_identity}".encode())
+        return digest.hexdigest()
+    files = [root] if root.is_file() else [p for p in root.rglob("*") if p.is_file() and ".cache" not in p.parts and ".git" not in p.parts]
+    for path in sorted(files, key=lambda item: str(item.relative_to(root.parent if root.is_file() else root))):
+        relative = str(path.relative_to(root.parent if root.is_file() else root)).replace("\\", "/")
+        digest.update(relative.encode())
+        digest.update(str(path.stat().st_size).encode())
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def references_fingerprint(
+    paths: list[str | Path],
+    config: str = "",
+    *,
+    descriptions=None,
+    names=None,
+    text_weight: float = 0.5,
+    model_identity: str = "",
+    preprocessing: str = "rgb-pil-v1",
+    gallery_mode: str = "text-only",
+    inventory_ids=None,
+) -> str:
     digest = hashlib.sha256(config.encode())
-    recipe = {"descriptions": descriptions or {}, "text_weight": text_weight, "model_identity": model_identity, "preprocessing": preprocessing}
+    recipe = {
+        "version": 2,
+        "gallery_mode": gallery_mode,
+        "inventory_ids": sorted(inventory_ids or []),
+        "descriptions": descriptions or {},
+        "names": names or {},
+        "text_weight": text_weight,
+        "model_identity": model_identity,
+        "model_content": _model_content_identity(model_identity) if model_identity else "",
+        "preprocessing": preprocessing,
+    }
     digest.update(json.dumps(recipe, sort_keys=True, ensure_ascii=True).encode())
     for path in sorted(map(str, paths)):
         p = Path(path)
@@ -68,5 +107,9 @@ def references_fingerprint(paths: list[str | Path], config: str = "", *, descrip
         if p.exists():
             stat = p.stat()
             digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
-            digest.update(p.read_bytes())
+            with p.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+        else:
+            digest.update(b"missing")
     return digest.hexdigest()
