@@ -1,0 +1,26 @@
+# ToolLighthouse: diseño de implementación
+
+## Objetivo y alcance autorizado
+Prototipo local ejecutable: fotografía desde teléfono → FastAPI → segmentación multiobjeto OpenCV → tracking → EmbeddingGemma 2 → rechazo/confirmación → JSON y overlay React → máscara completa y ACK del Nano. Desarrollo y tests CPU en este equipo; prueba final independiente en laptop del compañero. La solicitud autoriza implementar incrementalmente sin detenerse en el plan y seleccionar agentes, preferentemente AGY.
+
+## Estado y fuentes
+La carpeta inicial contiene `.venv`, `models/embeddinggemma-2`, `samples/objeto.jpg` y `probar_gemma.py`. Conservar estos archivos. No existe Git ni frontend en la carpeta; comprobar si hay uno próximo antes de crear React web. Fuentes: los dos prompts, y páginas Notion de arquitectura, visión y hardware consultadas el 13 de octubre de 2026. Notion señala RTX 5050 inicial y RTX 4060 alternativa; ambas se documentan, sin exigirlas para desarrollo.
+
+## Decisiones
+1. React web + TypeScript + Vite si no existe frontend reutilizable. Un dashboard móvil accesible, captura mediante selector `capture=environment` y cámara en contexto seguro, conexión configurable, cajas SVG sobre imagen normalizada y nueve LEDs con estado deseado/confirmado separado. FastAPI sirve el build para una URL local común.
+2. Paquete `src/toollighthouse` con configuración, cámara, segmentación, tracking, embeddings, galería, clasificador, estabilización, LEDs/serial, métricas, pipeline y CLI. FastAPI importa este mismo pipeline; nunca otro clasificador independiente. Imports pesados diferidos; modo mock no carga Torch.
+3. Tres modos: mock explícito, modelo real con LEDs simulados, y hardware real. Inventario de nueve categorías ficticias marcado como ejemplo: hardware real exige inventario confirmado y asignaciones únicas bits 0–8/pines D2–D10. No inferir nombres definitivos.
+4. Modelo local primero, sin descarga implícita ni entrenamiento. `SentenceTransformer`, diccionarios de imagen, audio desactivado, BF16 CUDA compatible o FP32, finite checks, lock único y lotes. Galería imagen-imagen inicial y mezcla textual configurable con caché invalidada por contenido de referencias/configuración/modelo. Separar referencia/calibración/evaluación.
+5. Foto significa una nueva escena: reinicia tracking de la escena y confirma sólo mediante observaciones válidas de esa fotografía (sin fingir frames temporales repetidos). Una política explícita de confirmación de foto puede autorizar tras umbral/margen conservadores; video conserva confirmación temporal por track. Resultados unknown/ambiguous no activan nuevos LEDs. Imagen de fondo y ROI persistidos, calibración móvil con misma orientación/dimensiones, EXIF normalizado y dimensiones verificadas.
+6. Autorización local con clave de emparejamiento configurada fuera de Git, sesiones con expiración y lease exclusivo de controlador. Lectores no controlan Nano. WebSocket autenticado con ticket efímero, eventos de detecciones, sistema y ACK. Sin claves compartidas en URLs persistentes. Expiración/liberación/fallo apaga estado y descarta inferencias anteriores por generación.
+7. Worker de inferencia independiente con un frame pendiente reemplazable, timestamp y descarte obsoleto; lock de modelo no bloquea loop FastAPI. Foto devuelve el resultado por JSON. Video inicial permite transporte ligero de frames sobre la misma API con backpressure, adaptador opcional WebRTC con última imagen y lifecycle limitado. No afirmar WebRTC operativo si sólo se prepara interfaz/documentación.
+8. Transporte serial acotado con ACK exacto, sincronización MASK:0 tras reinicio, reintentos y reconexión, refresco periódico y timeout de presencia independiente de inferencia. Estado solicitado no equivale a hardware confirmado. Firmware valida líneas completas y valores 0–511 y apaga a 2.5 s sin mensajes válidos.
+
+## Contratos de respuesta
+`frame_id`, `timestamp`, `mode`, `simulated`, `image.width/height` y orientación normalizada; `detections[]` con `track_id`, caja `[x,y,w,h]` en píxeles de imagen normalizada, centro, `class_id`, nombre, ubicación, top1/top2/margen y validación; `arduino` con máscara solicitada/confirmada, conexión, simulación y ACK; métricas reales o null. Todas las cajas deben usar la misma transformación que la imagen mostrada.
+
+## Validación
+Tests sintéticos para 0/1/2/3/5/9 objetos y duplicados; tracking y vencimiento; rechazo/margen/NaN; histéresis; LED y ACK; desconexión/watchdog; frames obsoletos; configuración; API multipart, exclusividad/expiración, WebSocket y errores. Build/typecheck y tests geometría frontend; flujo HTTP local foto→JSON→ACK simulado y evidencia visual del dashboard. Smoke real opt-in, omitido si no hay GPU/pesos. Firmware se compila si hay toolchain disponible; no sustituir mediciones físicas por pruebas de software.
+
+## Entrega y límites
+README PowerShell, guías desarrollo/laptop RTX4060/5050, red Wi-Fi/firewall/HTTPS, firmware/corriente, calibración/referencias/evaluación, reporte verificaciones. Preparar `.gitignore` y CI sin pesos, datasets, secretos ni entornos. No publicar, commit o push: la petición indica transferencia futura a GitHub sin un repositorio destino actual. Nombres reales, ajuste de umbrales, cámara fija, precisión, rendimiento GPU y circuito siguen pendientes de validación con equipo real.

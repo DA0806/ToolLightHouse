@@ -1,0 +1,17 @@
+{
+  "mode": "mock",
+  "pairing_key": "",
+  "auth_required": true,
+  "background_path": "data/calibration/background.png",
+  "roi_path": "data/calibration/roi.json",
+  "gallery_path": null,
+  "inventory_path": "inventory.example.json",
+  "inventory_confirmed": false,
+  "device": "auto",
+  "model_path": "models/embeddinggemma-2",
+  "text_weight": 0.0,
+  "batch_size": 9,
+  "frame_max_age_seconds": 1.0,
+  "prediction_max_age_seconds": 1.0,
+  "prediction_interval_seconds": 0.0
+}

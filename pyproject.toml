@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toollighthouse"
+version = "0.1.0"
+description = "Local multi-object tool recognition and LED controller"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24", "opencv-python>=4.8", "Pillow>=10", "fastapi>=0.110", "uvicorn[standard]>=0.29", "python-multipart>=0.0.9", "pyserial>=3.5"]
+
+[project.optional-dependencies]
+ai = ["torch", "sentence-transformers>=6.1.0", "transformers>=5.19.0"]
+dev = ["pytest", "pytest-asyncio", "httpx"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+toollighthouse = "toollighthouse.__main__:main"

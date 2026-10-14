@@ -1,0 +1,120 @@
+import json
+
+import pytest
+
+from toollighthouse.tracking import CentroidTracker
+
+
+def test_tracker_global_assignment_preserves_ids_when_detections_reorder():
+    tracker = CentroidTracker(max_distance=120, max_missed=2)
+    initial = tracker.update([(0, 0, 10, 10), (100, 0, 10, 10)])
+    first_id, second_id = (track.track_id for track in initial)
+
+    reordered = tracker.update([(105, 0, 10, 10), (75, 0, 10, 10)])
+    by_x = {track.bbox[0]: track.track_id for track in reordered}
+    assert by_x[75] == first_id
+    assert by_x[105] == second_id
+
+
+def test_tracker_expires_lost_tracks_before_reappearance():
+    tracker = CentroidTracker(max_distance=50, max_missed=1)
+    original = tracker.update([(10, 10, 20, 20)])[0].track_id
+    assert tracker.update([]) == []
+    assert tracker.update([]) == []
+    replacement = tracker.update([(10, 10, 20, 20)])[0].track_id
+    assert replacement != original
+
+
+def test_cli_rejects_negative_frame_limit_and_unconfigured_physical_leds():
+    from toollighthouse.__main__ import main
+
+    with pytest.raises(SystemExit):
+        main(["run", "--max-frames", "-1"])
+    with pytest.raises(SystemExit, match="serial"):
+        main(["test-leds"])
+
+
+def test_cli_rejects_simulated_and_physical_serial_together():
+    from toollighthouse.__main__ import main
+
+    with pytest.raises(SystemExit):
+        main(["test-leds", "--simulate-leds", "--serial", "COM-test"])
+
+
+def _inventory_file(path):
+    payload = {
+        "example": False,
+        "categories": [
+            {
+                "class_id": f"tool_{index + 1}",
+                "name": f"Tool {index + 1}",
+                "location": f"slot-{index + 1}",
+                "led_index": index,
+                "pin": index + 2,
+            }
+            for index in range(9)
+        ],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_test_leds_always_fails_safe_and_closes_after_ack_error(monkeypatch, tmp_path):
+    from toollighthouse.__main__ import main
+
+    inventory = tmp_path / "inventory.json"
+    _inventory_file(inventory)
+
+    class FakeSerial:
+        simulated = False
+        instances = []
+
+        def __init__(self, port):
+            self.calls = []
+            self.closed = False
+            self.__class__.instances.append(self)
+
+        def open(self):
+            self.calls.append("open")
+
+        def send_mask(self, mask):
+            self.calls.append(mask)
+            return mask != 511
+
+        def close(self):
+            self.closed = True
+
+        def status(self):
+            return {"connected": True}
+
+    monkeypatch.setattr("toollighthouse.serial_transport.SerialTransport", FakeSerial)
+    with pytest.raises(SystemExit, match="ACK"):
+        main(["test-leds", "--mode", "real", "--serial", "COM-test", "--inventory", str(inventory), "--confirm-inventory"])
+    assert FakeSerial.instances[0].calls == ["open", 0, 511, 0]
+    assert FakeSerial.instances[0].closed is True
+
+
+def test_run_closes_camera_if_pipeline_initialization_fails(monkeypatch):
+    from toollighthouse.__main__ import main
+
+    class FakeCamera:
+        instances = []
+
+        def __init__(self, source):
+            self.closed = False
+            self.__class__.instances.append(self)
+
+        def open(self):
+            return self
+
+        def close(self):
+            self.closed = True
+
+    class FailingPipeline:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("model/gallery failed")
+
+    monkeypatch.setattr("toollighthouse.camera.OpenCVCamera", FakeCamera)
+    monkeypatch.setattr("toollighthouse.pipeline.Pipeline", FailingPipeline)
+    with pytest.raises(RuntimeError, match="model/gallery"):
+        main(["run", "--headless", "--max-frames", "1"])
+    assert FakeCamera.instances[0].closed is True
