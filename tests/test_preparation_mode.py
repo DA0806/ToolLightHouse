@@ -1,9 +1,20 @@
+import sys
+import types
+
 import pytest
 from fastapi.testclient import TestClient
 
 from toollighthouse.api import create_app
 from toollighthouse.config import Settings
 from toollighthouse.pipeline import Pipeline
+
+
+@pytest.fixture
+def fake_torch_runtime(monkeypatch):
+    """Make readiness deterministic for tests that inject a fake embedder."""
+    fake_torch = types.ModuleType("torch")
+    fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
 
 def test_safe_startup_in_real_mode_without_assets_enters_preparation():
@@ -92,7 +103,7 @@ class FakeEmbedder:
         return vecs / norms
 
 
-def test_first_run_preparation_builds_text_gallery_with_fake_embedder_and_enables_real_readiness(tmp_path):
+def test_first_run_preparation_builds_text_gallery_with_fake_embedder_and_enables_real_readiness(tmp_path, fake_torch_runtime):
     import io
     from PIL import Image
 
@@ -163,7 +174,7 @@ def test_first_run_preparation_builds_text_gallery_with_fake_embedder_and_enable
     assert mode_resp.json()["mode"] == "real"
 
 
-def test_rollback_with_incompatible_gallery_falls_back_to_preparation_mode(tmp_path):
+def test_rollback_with_incompatible_gallery_falls_back_to_preparation_mode(tmp_path, fake_torch_runtime):
     import io
     from PIL import Image
     from toollighthouse.config import Inventory, ToolCategory

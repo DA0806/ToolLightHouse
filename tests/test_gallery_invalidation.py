@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -12,6 +14,14 @@ from toollighthouse.pipeline import Pipeline
 class NoopEmbedder:
     def encode_images(self, images):
         return np.ones((len(images), 4), dtype=np.float32)
+
+
+@pytest.fixture
+def fake_torch_runtime(monkeypatch):
+    """Provide only the torch surface these injected test embedders need."""
+    fake_torch = types.ModuleType("torch")
+    fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
 
 def _inventory(description="hammer"):
@@ -61,14 +71,14 @@ def _write_gallery(tmp_path, *, descriptions=None, text_weight=0.0, model_path=N
     return path, model_path, references[0]
 
 
-def test_real_pipeline_accepts_gallery_with_matching_manifest(tmp_path):
+def test_real_pipeline_accepts_gallery_with_matching_manifest(tmp_path, fake_torch_runtime):
     gallery, model_path, _ = _write_gallery(tmp_path)
     pipeline = Pipeline(_real_settings(tmp_path, gallery, model_path=model_path), embedder=NoopEmbedder())
     assert pipeline.classifier.references["tool_1"].shape == (4,)
 
 
 @pytest.mark.parametrize("change", ["description", "text_weight", "model_identity", "reference_bytes"])
-def test_real_pipeline_rejects_gallery_when_live_inputs_no_longer_match_manifest(tmp_path, change):
+def test_real_pipeline_rejects_gallery_when_live_inputs_no_longer_match_manifest(tmp_path, change, fake_torch_runtime):
     gallery, model_path, reference = _write_gallery(tmp_path)
     if change == "description":
         inventory = _inventory("different visual description")
@@ -86,7 +96,7 @@ def test_real_pipeline_rejects_gallery_when_live_inputs_no_longer_match_manifest
         Pipeline(settings, embedder=NoopEmbedder())
 
 
-def test_real_pipeline_rejects_gallery_with_unknown_or_missing_inventory_class(tmp_path):
+def test_real_pipeline_rejects_gallery_with_unknown_or_missing_inventory_class(tmp_path, fake_torch_runtime):
     gallery, model_path, _ = _write_gallery(tmp_path, class_id="unknown_tool")
     with pytest.raises(RuntimeError, match="stale|reference|class|rebuild"):
         Pipeline(_real_settings(tmp_path, gallery, model_path=model_path), embedder=NoopEmbedder())
