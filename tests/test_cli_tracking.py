@@ -155,4 +155,42 @@ def test_cli_serve_uses_saved_real_config_and_enters_safe_preparation(monkeypatc
 
     monkeypatch.setattr("uvicorn.run", fake_run)
     assert main(["serve", "--config", str(config_file), "--pairing-key", "serve-secret", "--host", "127.0.0.1", "--port", "8123"]) == 0
-    assert captured["kwargs"] == {"host": "127.0.0.1", "port": 8123}
+    assert captured["kwargs"] == {
+        "host": "127.0.0.1",
+        "port": 8123,
+        "log_level": "warning",
+        "access_log": False,
+    }
+
+
+def test_cli_serve_passes_validated_tls_files(monkeypatch, tmp_path):
+    from toollighthouse.__main__ import main
+
+    cert = tmp_path / "lan-cert.pem"
+    key = tmp_path / "lan-key.pem"
+    cert.write_text("certificate", encoding="utf-8")
+    key.write_text("private key", encoding="utf-8")
+    captured = {}
+
+    def fake_run(app, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    assert main([
+        "serve",
+        "--pairing-key",
+        "secret",
+        "--ssl-certfile",
+        str(cert),
+        "--ssl-keyfile",
+        str(key),
+    ]) == 0
+    assert captured["ssl_certfile"] == str(cert)
+    assert captured["ssl_keyfile"] == str(key)
+
+
+def test_cli_rejects_unpaired_tls_options(tmp_path):
+    from toollighthouse.__main__ import main
+
+    with pytest.raises(SystemExit):
+        main(["serve", "--ssl-certfile", str(tmp_path / "cert.pem")])

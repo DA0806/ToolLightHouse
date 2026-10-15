@@ -6,9 +6,13 @@ import {
   getCalibrationBackgroundBlob,
   updateConfig,
   updateRoi,
+  getCalibrationProfiles,
+  captureProfileBackground,
+  updateProfileRoi,
+  confirmLegacyProfile,
   type Credentials,
 } from '../api'
-import type { CalibrationMeta, ConfigResponse, SettingsConfig } from '../types'
+import type { CalibrationMeta, CalibrationProfile, ConfigResponse, SettingsConfig } from '../types'
 
 interface CalibrationViewProps {
   apiUrl: string
@@ -33,6 +37,9 @@ export function CalibrationView({
   const initialSettings = draftConfig?.settings || config?.settings || null
   const [settings, setSettings] = useState<SettingsConfig | null>(() => initialSettings)
   const [calibration, setCalibration] = useState<CalibrationMeta | null>(null)
+  const [profiles, setProfiles] = useState<Record<string, CalibrationProfile>>({})
+  const [selectedProfileSource, setSelectedProfileSource] = useState<string>('remote_phone')
+  const [confirmingLegacy, setConfirmingLegacy] = useState(false)
   const [backgroundUrl, setBackgroundUrl] = useState<string | null>(null)
   const [roi, setRoi] = useState<[number, number, number, number] | null>(() => initialSettings?.roi || null)
   const [drawing, setDrawing] = useState(false)
@@ -118,6 +125,63 @@ export function CalibrationView({
   useEffect(() => {
     void loadCalibration()
   }, [loadCalibration])
+
+  const loadProfiles = useCallback(async () => {
+    if (!credentials) return
+    try {
+      const res = await getCalibrationProfiles(apiUrl, credentials)
+      if (res && res.profiles) {
+        setProfiles(res.profiles)
+      }
+    } catch {
+      // ignore
+    }
+  }, [apiUrl, credentials])
+
+  useEffect(() => {
+    void loadProfiles()
+  }, [loadProfiles])
+
+  const handleConfirmLegacy = async (profileId: string) => {
+    if (!credentials) return
+    setConfirmingLegacy(true)
+    setError(null)
+    setSuccessMessage(null)
+    try {
+      await confirmLegacyProfile(apiUrl, credentials, profileId)
+      await loadProfiles()
+      setSuccessMessage(`Perfil heredado ${profileId} confirmado para producción.`)
+    } catch (caught: any) {
+      setError(caught instanceof Error ? caught.message : 'Error al confirmar perfil')
+    } finally {
+      setConfirmingLegacy(false)
+    }
+  }
+
+  const handleCaptureSourceBackground = async (sourceId: string, file?: File | null) => {
+    if (!credentials) return
+    setUploadingBg(true)
+    setError(null)
+    setSuccessMessage(null)
+    try {
+      const updated = await captureProfileBackground(apiUrl, credentials, sourceId, file || undefined)
+      setProfiles((previous) => ({ ...previous, [sourceId]: updated }))
+      if (updated.resolution?.width && updated.resolution?.height) {
+        setCalibration((previous) => previous || {
+          calibrated: false,
+          status: updated.status,
+          image: { width: updated.resolution.width, height: updated.resolution.height, orientation: updated.orientation },
+          roi: updated.roi || null,
+        })
+      }
+      await loadProfiles()
+      setSuccessMessage(`Fondo guardado con éxito para ${sourceId} (${updated.resolution.width}x${updated.resolution.height}).`)
+    } catch (caught: any) {
+      setError(caught instanceof Error ? caught.message : 'Error al capturar fondo para esta cámara')
+    } finally {
+      setUploadingBg(false)
+    }
+  }
 
   // Recognition mode handlers
   const handleToggleHybrid = async (enabled: boolean) => {
@@ -276,17 +340,25 @@ export function CalibrationView({
     setError(null)
     setSuccessMessage(null)
     try {
-      const res = await updateRoi(apiUrl, credentials, roi)
-      setRoi(res.roi)
-      const latest = await refreshAuthoritativeConfig(['roi'])
+      const selectedProfile = profiles[selectedProfileSource]
+      const profileResult = selectedProfile
+        ? await updateProfileRoi(apiUrl, credentials, selectedProfileSource, roi)
+        : null
+      const res = profileResult || await updateRoi(apiUrl, credentials, roi)
+      const savedRoi = res.roi || roi
+      setRoi(savedRoi)
+      if (profileResult) {
+        setProfiles((previous) => ({ ...previous, [selectedProfileSource]: profileResult }))
+      }
+      const latest = profileResult ? null : await refreshAuthoritativeConfig(['roi'])
       const source = draftConfig || config
       if (!latest && source && onDraftChange) {
         onDraftChange({
           ...source,
-          settings: { ...source.settings, roi: res.roi },
+          settings: { ...source.settings, roi: savedRoi },
         })
       }
-      setSuccessMessage(`Región de interés (ROI [${res.roi.join(', ')}]) guardada correctamente.`)
+      setSuccessMessage(`Región de interés (ROI [${savedRoi.join(', ')}]) guardada correctamente.`)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Error al guardar ROI')
     } finally {
@@ -340,7 +412,6 @@ export function CalibrationView({
           <strong>Modo de solo lectura:</strong> Se requiere rol Administrador para cambiar modos de reconocimiento o calibrar la bandeja.
         </div>
       )}
-
       {/* Section 1: Recognition Modes */}
       <article className="card calibration-mode-card">
         <div className="card-header">
@@ -673,6 +744,124 @@ export function CalibrationView({
             )}
           </div>
         </div>
+      </article>
+
+      {/* Section 3: Multi-Camera Calibration Profiles */}
+      <article className="card calibration-mode-card" aria-label="Perfiles de Calibración por Cámara">
+        <div className="card-header">
+          <h3>Perfiles de Calibración por Cámara (Multicámara)</h3>
+          <span className="badge badge-accent">
+            {Object.keys(profiles).length} perfiles
+          </span>
+        </div>
+
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', margin: '14px 0' }}>
+          {['remote_phone', 'laptop_builtin', 'usb_webcam', 'operator_device', 'manual_upload', 'unbound_legacy'].map((srcId) => {
+            const prof = profiles[srcId]
+            const isSelected = selectedProfileSource === srcId
+            const statusColor = prof?.status === 'ready' ? '#166534' : prof?.status === 'unbound_legacy' ? '#c2410c' : '#854d0e'
+            const statusBg = prof?.status === 'ready' ? '#dcfce7' : prof?.status === 'unbound_legacy' ? '#ffedd5' : '#fef9c3'
+            return (
+              <button
+                key={srcId}
+                type="button"
+                className={`button button-sm ${isSelected ? 'button-primary' : 'button-secondary'}`}
+                onClick={() => setSelectedProfileSource(srcId)}
+              >
+                <span>{srcId}</span>
+                {prof && (
+                  <span style={{ fontSize: '10px', padding: '2px 6px', borderRadius: '4px', background: statusBg, color: statusColor, fontWeight: 700 }}>
+                    {prof.status}
+                  </span>
+                )}
+              </button>
+            )
+          })}
+        </div>
+
+        {profiles[selectedProfileSource] ? (
+          <div style={{ padding: '14px', border: '1px solid #e2e8f0', borderRadius: '10px', background: '#f8fafc' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+              <strong>Fuente seleccionada: {selectedProfileSource}</strong>
+              <span className={`badge ${profiles[selectedProfileSource].status === 'ready' ? 'badge-accent' : 'badge-neutral'}`}>
+                {profiles[selectedProfileSource].status}
+              </span>
+            </div>
+            <p style={{ margin: '4px 0', fontSize: '13px', color: '#475569' }}>
+              Resolución: {profiles[selectedProfileSource].resolution.width}x{profiles[selectedProfileSource].resolution.height} · Orientación: {profiles[selectedProfileSource].orientation}
+            </p>
+            {profiles[selectedProfileSource].background_filename && (
+              <p style={{ margin: '4px 0', fontSize: '13px', color: '#475569' }}>
+                Archivo de fondo: <code>{profiles[selectedProfileSource].background_filename}</code>
+              </p>
+            )}
+            {profiles[selectedProfileSource].roi && (
+              <p style={{ margin: '4px 0', fontSize: '13px', color: '#475569' }}>
+                ROI: [{profiles[selectedProfileSource].roi.join(', ')}]
+              </p>
+            )}
+
+            {profiles[selectedProfileSource].needs_confirmation && isAdmin && (
+              <div style={{ marginTop: '12px' }}>
+                <button
+                  type="button"
+                  className="button button-accent button-sm"
+                  onClick={() => void handleConfirmLegacy(selectedProfileSource)}
+                  disabled={confirmingLegacy}
+                >
+                  {confirmingLegacy ? 'Confirmando...' : 'Confirmar Perfil Heredado para Producción'}
+                </button>
+              </div>
+            )}
+
+            {isAdmin && (
+              <div style={{ marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <label className="button button-sm button-secondary">
+                  <span>Subir foto de fondo</span>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png"
+                    style={{ position: 'absolute', width: '1px', height: '1px', clip: 'rect(0,0,0,0)' }}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0]
+                      e.target.value = ''
+                      void handleCaptureSourceBackground(selectedProfileSource, f)
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="button button-sm button-secondary"
+                  onClick={() => void handleCaptureSourceBackground(selectedProfileSource)}
+                  disabled={uploadingBg}
+                >
+                  {uploadingBg ? 'Capturando...' : 'Capturar desde fuente activa'}
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div style={{ padding: '14px', color: '#64748b', fontSize: '13px', background: '#f8fafc', borderRadius: '10px' }}>
+            No se ha calibrado esta fuente todavía. Captura o sube una imagen de fondo para crear su perfil.
+            {isAdmin && (
+              <div style={{ marginTop: '10px' }}>
+                <label className="button button-sm button-primary">
+                  <span>Capturar Fondo Inicial</span>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png"
+                    style={{ position: 'absolute', width: '1px', height: '1px', clip: 'rect(0,0,0,0)' }}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0]
+                      e.target.value = ''
+                      void handleCaptureSourceBackground(selectedProfileSource, f)
+                    }}
+                  />
+                </label>
+              </div>
+            )}
+          </div>
+        )}
       </article>
     </section>
   )

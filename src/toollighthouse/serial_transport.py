@@ -48,9 +48,13 @@ class SimulatedSerial:
         self.requested_mask = 0
         self.confirmed_mask: int | None = 0
         self.last_ack_at = time.time()
+        self._scene_deadline = 0.0
+        self._explicit_deadline = False
+        self._transport_generation = 0
 
     def connect(self):
         with self._state_lock:
+            self._transport_generation += 1
             self.connected = True
             self.confirmed_mask = 0
             self.requested_mask = 0
@@ -59,14 +63,29 @@ class SimulatedSerial:
 
     def disconnect(self):
         with self._state_lock:
+            self._transport_generation += 1
             self.connected = False
             self.confirmed_mask = None
             self.requested_mask = 0
             return True
 
-    def send_mask(self, mask: int, retries: int = 2) -> bool:
+    def set_scene_deadline(self, deadline: float) -> int:
+        with self._state_lock:
+            self._transport_generation += 1
+            self._explicit_deadline = True
+            self._scene_deadline = deadline
+            if deadline <= time.time():
+                self.requested_mask = 0
+            return self._transport_generation
+
+    def send_mask(self, mask: int, retries: int = 2, expected_generation: int | None = None) -> bool:
         validate_mask(mask)
         with self._state_lock:
+            expected = self._transport_generation if expected_generation is None else expected_generation
+            if mask != 0 and expected != self._transport_generation:
+                return False
+            if mask != 0 and self._explicit_deadline and self._scene_deadline <= time.time():
+                mask = 0
             self.requested_mask = mask
             if not self.connected:
                 self.confirmed_mask = None
@@ -101,6 +120,7 @@ class SerialTransport:
         self.last_ack_at = 0.0
         self._scene_deadline = 0.0
         self._explicit_deadline = False
+        self._transport_generation = 0
         self._closed = False
         self._heartbeat_stop = threading.Event()
         self._heartbeat: threading.Thread | None = None
@@ -123,11 +143,14 @@ class SerialTransport:
             self._scene_deadline = deadline
             if deadline <= time.time():
                 self.requested_mask = 0
+            self._transport_generation += 1
+            return self._transport_generation
 
     def _disconnect_locked(self):
         with self._state_lock:
             port, self._serial = self._serial, None
             self.confirmed_mask = None
+            self._transport_generation += 1
         if port is not None:
             try:
                 port.close()
@@ -149,15 +172,27 @@ class SerialTransport:
             self._disconnect_locked()
             return False
 
-    def _exchange_locked(self, mask, retries):
-        with self._state_lock:
-            self.confirmed_mask = None
-            port = self._serial
-        if port is None:
-            return False
+    def _exchange_locked(self, mask, retries, expected_generation: int | None = None):
         for _ in range(retries + 1):
+            with self._state_lock:
+                port = self._serial
+                if port is None:
+                    return False
+                if mask != 0:
+                    if expected_generation is not None and expected_generation != self._transport_generation:
+                        return False
+                    if self._closed or self._scene_deadline <= time.time():
+                        mask = 0
+                        expected_generation = self._transport_generation
+                self.confirmed_mask = None
+                # Keep the state lock only across the bounded write. ACK reads
+                # happen without it so lease/fence updates stay responsive.
+                try:
+                    port.write(f"MASK:{mask}\n".encode("ascii"))
+                except Exception:
+                    self._disconnect_locked()
+                    return False
             try:
-                port.write(f"MASK:{mask}\n".encode("ascii"))
                 line = port.readline().decode("ascii", "replace")
             except Exception:
                 self._disconnect_locked()
@@ -168,21 +203,28 @@ class SerialTransport:
                 continue
             if ack == mask:
                 with self._state_lock:
+                    if expected_generation is not None and expected_generation != self._transport_generation:
+                        self.confirmed_mask = None
+                        return False
                     self.confirmed_mask = ack
                     self.last_ack_at = time.time()
                 return True
         return False
 
-    def send_mask(self, mask: int, retries: int | None = None) -> bool:
+    def send_mask(self, mask: int, retries: int | None = None, expected_generation: int | None = None) -> bool:
         validate_mask(mask)
+        with self._state_lock:
+            captured_generation = self._transport_generation if expected_generation is None else expected_generation
         with self._lock:
             with self._state_lock:
+                if mask != 0 and captured_generation != self._transport_generation:
+                    return False
                 if not self._explicit_deadline:
                     self._scene_deadline = time.time() + self.watchdog_seconds
                 if self._closed or self._scene_deadline <= time.time():
                     mask = 0
                 self.requested_mask = mask
-            return self._exchange_locked(mask, self.retries if retries is None else retries)
+            return self._exchange_locked(mask, self.retries if retries is None else retries, captured_generation)
 
     def status(self):
         with self._state_lock:
@@ -200,7 +242,8 @@ class SerialTransport:
                 if self._scene_deadline <= time.time():
                     self.requested_mask = 0
                 mask = self.requested_mask
-            self._exchange_locked(mask, 0)
+                expected_generation = self._transport_generation
+            self._exchange_locked(mask, 0, expected_generation)
 
     def _heartbeat_loop(self):
         while not self._heartbeat_stop.wait(min(1.0, self.watchdog_seconds / 2)):
@@ -214,6 +257,7 @@ class SerialTransport:
             with self._state_lock:
                 self.requested_mask = 0
                 self._scene_deadline = 0
+                self._transport_generation += 1
             self._exchange_locked(0, 0)
             self._disconnect_locked()
             heartbeat = self._heartbeat
@@ -240,6 +284,7 @@ class SerialTransport:
             with self._state_lock:
                 self.requested_mask = 0
                 self._scene_deadline = 0
+                self._transport_generation += 1
             self._exchange_locked(0, 0)
             self._disconnect_locked()
         if self._heartbeat:

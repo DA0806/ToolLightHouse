@@ -1,7 +1,7 @@
 :root {
-  font-family: "Segoe UI", system-ui, sans-serif;
+  font-family: "Albert Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
   color: #172b46;
-  background: #eef3f8;
+  background: #f8fafc;
   font-synthesis: none;
   line-height: 1.45;
 }
@@ -46,6 +46,8 @@ h2 { font-size: 20px; line-height: 1.2; margin: 0; letter-spacing: -.02em; }
 .button-secondary { color: #172b46; background: #fff; border-color: #c1cfdd; }
 .button-accent { color: #fff; background: #17636c; }
 .button-danger { color: #b42335; background: #fff; border-color: #e6b3bb; }
+.button-purple { color: #fff; background: #7c3aed; }
+.button-purple:hover:not(:disabled) { background: #6d28d9; }
 .button.full { width: 100%; }
 .button input[type=file] { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
 .viewer-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: #52647a; font-size: 12px; }
@@ -768,3 +770,522 @@ footer { color: #718198; display: flex; justify-content: space-between; gap: 16p
   margin-top: 12px;
 }
 .import-actions { display: flex; gap: 8px; margin-top: 8px; }
+
+/* -------------------------------------------------------------------------- */
+/* Phase G: KeyTool Tracker Visual Adaptation & Multi-Camera System           */
+/* -------------------------------------------------------------------------- */
+
+.camera-selector-container {
+  margin-bottom: 14px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 10px 14px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.camera-selector-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.camera-selector-select-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.camera-selector-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: #334155;
+}
+
+.camera-select-wrapper select {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #0f172a;
+  outline: none;
+  cursor: pointer;
+}
+
+.camera-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.camera-actions-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.camera-action-btn {
+  font-size: 12px;
+  padding: 6px 12px;
+  min-height: 34px;
+  border-radius: 8px;
+}
+
+.button-purple {
+  background: #7e22ce;
+  color: #ffffff;
+  border: 1px solid transparent;
+}
+.button-purple:hover:not(:disabled) {
+  background: #6b21a8;
+}
+
+/* 3x3 KeyTool Inventory Grid */
+.inventory-3x3-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  min-width: 0;
+}
+
+.inventory-slot-card {
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-width: 0;
+  min-height: 84px;
+  transition: all 0.15s ease;
+}
+
+.inventory-slot-card.stored {
+  border-color: #e2e8f0;
+  background: #ffffff;
+}
+
+.inventory-slot-card.missing {
+  border-color: #9333ea;
+  background: #faf5ff;
+  box-shadow: 0 0 10px rgba(147, 51, 234, 0.12);
+}
+
+.inventory-slot-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+
+.inventory-slot-name {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: #0f172a;
+  line-height: 1.25;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow-wrap: anywhere;
+}
+
+.inventory-slot-card.missing .inventory-slot-name {
+  color: #6b21a8;
+}
+
+.inventory-status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.inventory-status-dot.stored {
+  border: 2px solid #22c55e;
+  background: #22c55e;
+  box-shadow: 0 0 6px rgba(34, 197, 94, 0.4);
+}
+
+.inventory-status-dot.missing {
+  border: 2.5px solid #9333ea;
+  background: transparent;
+  box-shadow: 0 0 6px rgba(147, 51, 234, 0.4);
+}
+
+.inventory-slot-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.inventory-slot-location {
+  min-width: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  overflow-wrap: anywhere;
+}
+
+.inventory-slot-status-text {
+  min-width: 0;
+  font-size: 9px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+
+.inventory-slot-status-text.stored {
+  color: #166534;
+  background: #dcfce7;
+}
+
+.inventory-slot-status-text.missing {
+  color: #7e22ce;
+  background: #f3e8ff;
+}
+
+/* Authentic Activity Feed */
+.activity-feed-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 8px 12px;
+  background: #ffffff;
+}
+
+.activity-feed-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid #f1f5f9;
+  font-size: 12px;
+}
+.activity-feed-item:last-child {
+  border-bottom: none;
+}
+
+.activity-feed-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.activity-feed-dot.info { background: #3b82f6; }
+.activity-feed-dot.success { background: #22c55e; }
+.activity-feed-dot.warning { background: #f59e0b; }
+.activity-feed-dot.error { background: #ef4444; }
+
+.activity-feed-time {
+  font-size: 11px;
+  font-weight: 700;
+  color: #94a3b8;
+  width: 52px;
+  flex-shrink: 0;
+}
+
+.activity-feed-msg {
+  color: #334155;
+  flex: 1;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Offline QR Modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(4px);
+  display: grid;
+  place-items: center;
+  z-index: 1000;
+  padding: 16px;
+}
+
+.qr-modal-card {
+  background: #ffffff;
+  border-radius: 20px;
+  max-width: 440px;
+  width: 100%;
+  padding: 24px;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+  border: 1px solid #e2e8f0;
+}
+
+.qr-modal-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  position: relative;
+  margin-bottom: 18px;
+}
+
+.qr-modal-icon-badge {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: #f3e8ff;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.qr-modal-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.qr-modal-subtitle {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.qr-modal-close {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 4px;
+}
+.qr-modal-close:hover {
+  color: #0f172a;
+}
+
+.qr-modal-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.qr-image-wrapper {
+  background: #ffffff;
+  padding: 12px;
+  border-radius: 16px;
+  border: 2px solid #e2e8f0;
+  margin-bottom: 12px;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+}
+
+.qr-image {
+  display: block;
+  width: 220px;
+  height: 220px;
+}
+
+.qr-loading {
+  height: 220px;
+  display: grid;
+  place-items: center;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.qr-expired-alert {
+  padding: 24px 16px;
+  color: #92400e;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.qr-timer-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #7e22ce;
+  background: #faf5ff;
+  padding: 4px 12px;
+  border-radius: 999px;
+  margin-bottom: 14px;
+}
+
+.qr-url-box {
+  width: 100%;
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.qr-url-text {
+  font-size: 11px;
+  font-family: monospace;
+  color: #334155;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  text-align: left;
+}
+
+.qr-copy-btn {
+  background: transparent;
+  border: none;
+  color: #64748b;
+  cursor: pointer;
+  padding: 2px;
+}
+.qr-copy-btn:hover {
+  color: #0f172a;
+}
+
+.qr-security-note {
+  font-size: 10px;
+  color: #94a3b8;
+  line-height: 1.4;
+  margin: 0 0 16px;
+}
+
+.qr-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  width: 100%;
+}
+
+/* Dedicated Remote Camera View (/camera) */
+.remote-camera-container {
+  min-height: 100vh;
+  background: #0a0f1c;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  color: #ffffff;
+}
+
+.remote-camera-card {
+  max-width: 440px;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.remote-camera-icon {
+  color: #9333ea;
+  margin-bottom: 12px;
+}
+
+.remote-camera-title {
+  font-size: 24px;
+  font-weight: 800;
+  margin: 0 0 6px;
+  color: #ffffff;
+}
+
+.remote-camera-subtitle {
+  font-size: 13px;
+  color: #94a3b8;
+  margin: 0 0 20px;
+}
+
+.remote-camera-viewport {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  background: #000000;
+  border-radius: 20px;
+  overflow: hidden;
+  border: 3px solid #7e22ce;
+  box-shadow: 0 0 25px rgba(126, 34, 206, 0.45);
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.remote-camera-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.remote-camera-status-overlay {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+}
+
+.badge {
+  font-size: 11px;
+  font-weight: 800;
+  padding: 4px 8px;
+  border-radius: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.badge-success { background: #16a34a; color: #ffffff; }
+.badge-warning { background: #d97706; color: #ffffff; }
+.badge-neutral { background: #475569; color: #ffffff; }
+
+.remote-camera-info-row {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 16px;
+  padding: 10px 14px;
+  background: #1e293b;
+  border-radius: 10px;
+}
+
+.remote-camera-note {
+  font-size: 12px;
+  color: #64748b;
+  margin-top: 16px;
+}
+
+.remote-camera-error {
+  background: #7f1d1d;
+  color: #fecaca;
+  padding: 16px;
+  border-radius: 12px;
+  border: 1px solid #991b1b;
+  margin: 12px 0;
+  font-size: 13px;
+}

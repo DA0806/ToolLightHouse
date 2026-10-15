@@ -1,3 +1,4 @@
+import threading
 import time
 from types import SimpleNamespace
 import pytest
@@ -15,7 +16,9 @@ def _admin_headers(client, admin_key="admin_secret"):
         headers={"X-Admin-Key": admin_key},
         json={"device_id": "laptop", "role": "admin"},
     ).json()
-    return {"X-Session-Id": session["session_id"], "X-Session-Ticket": session["ticket"]}
+    headers = {"X-Session-Id": session["session_id"], "X-Session-Ticket": session["ticket"]}
+    client.post("/v1/sessions/lease/takeover", headers=headers)
+    return headers
 
 
 def test_list_com_ports_returns_list():
@@ -273,4 +276,247 @@ def test_auto_off_ack_failure_is_published_without_claiming_physical_zero(tmp_pa
             auto_off_ack = websocket.receive_json()
         assert auto_off_ack["arduino"]["ack"] is False
         assert auto_off_ack["arduino"]["confirmed_mask"] == 2
+
+
+def test_maintenance_requires_held_physical_lease(tmp_path):
+    settings = Settings(mode="mock", pairing_key="secret", admin_key="admin_secret")
+    client = TestClient(create_app(settings, config_path=tmp_path / "app_config.json"))
+
+    # Admin session without takeover / without held physical lease
+    session = client.post(
+        "/v1/sessions",
+        headers={"X-Admin-Key": "admin_secret"},
+        json={"device_id": "laptop", "role": "admin"},
+    ).json()
+    headers = {"X-Session-Id": session["session_id"], "X-Session-Ticket": session["ticket"]}
+
+    # enter_maintenance without held lease must return 409
+    resp = client.post("/v1/arduino/maintenance/enter", headers=headers)
+    assert resp.status_code == 409
+    assert "lease" in resp.json()["detail"].lower()
+
+    # test-led without held lease must return 409
+    resp_led = client.post("/v1/arduino/maintenance/test-led/0", headers=headers)
+    assert resp_led.status_code == 409
+    assert "lease" in resp_led.json()["detail"].lower()
+
+    # all-off without held lease must return 409
+    resp_off = client.post("/v1/arduino/maintenance/all-off", headers=headers)
+    assert resp_off.status_code == 409
+    assert "lease" in resp_off.json()["detail"].lower()
+
+
+def test_maintenance_rejected_when_operator_holds_lease(tmp_path):
+    settings = Settings(mode="mock", pairing_key="secret", admin_key="admin_secret")
+    client = TestClient(create_app(settings, config_path=tmp_path / "app_config.json"))
+
+    # Operator gets controller lease
+    ctrl = client.post(
+        "/v1/sessions",
+        headers={"X-Pairing-Key": "secret"},
+        json={"device_id": "phone-op", "role": "controller"},
+    ).json()
+
+    # Admin creates session without takeover
+    admin = client.post(
+        "/v1/sessions",
+        headers={"X-Admin-Key": "admin_secret"},
+        json={"device_id": "laptop-admin", "role": "admin"},
+    ).json()
+    admin_headers = {"X-Session-Id": admin["session_id"], "X-Session-Ticket": admin["ticket"]}
+
+    # Admin is blocked from maintenance because operator holds the lease
+    enter_resp = client.post("/v1/arduino/maintenance/enter", headers=admin_headers)
+    assert enter_resp.status_code == 409
+    assert "lease" in enter_resp.json()["detail"].lower()
+
+    # Once admin takes over, admin holds lease and can enter maintenance
+    takeover = client.post("/v1/sessions/lease/takeover", headers=admin_headers)
+    assert takeover.status_code == 200
+    enter_ok = client.post("/v1/arduino/maintenance/enter", headers=admin_headers)
+    assert enter_ok.status_code == 200
+    assert enter_ok.json()["maintenance_mode"] is True
+
+
+def test_maintenance_exit_emergency_zero_semantics(tmp_path):
+    settings = Settings(mode="mock", pairing_key="secret", admin_key="admin_secret")
+    serial = SimulatedSerial()
+    pipeline = Pipeline(settings, serial=serial, safe_startup=True)
+    client = TestClient(create_app(settings, pipeline=pipeline, config_path=tmp_path / "app_config.json"))
+    headers = _admin_headers(client)
+
+    # Enter maintenance and turn on an LED
+    client.post("/v1/arduino/maintenance/enter", headers=headers)
+    client.post("/v1/arduino/maintenance/test-led/3?duration=2.0", headers=headers)
+    assert serial.status()["confirmed_mask"] == 8
+
+    # Leave maintenance immediately - must zero LEDs and reset maintenance mode safely
+    leave_resp = client.post("/v1/arduino/maintenance/leave", headers=headers)
+    assert leave_resp.status_code == 200
+    assert leave_resp.json()["maintenance_mode"] is False
+    assert serial.status()["requested_mask"] == 0
+    assert serial.status()["confirmed_mask"] == 0
+
+
+def test_maintenance_lease_expiry_rejects_further_actuation(tmp_path):
+    settings = Settings(mode="mock", pairing_key="secret", admin_key="admin_secret", lease_ttl_seconds=0.2)
+    serial = SimulatedSerial()
+    pipeline = Pipeline(settings, serial=serial, safe_startup=True)
+    client = TestClient(create_app(settings, pipeline=pipeline, config_path=tmp_path / "app_config.json"))
+    headers = _admin_headers(client)
+
+    # Enter maintenance while holding lease
+    client.post("/v1/arduino/maintenance/enter", headers=headers)
+
+    # Wait for lease to expire
+    time.sleep(0.3)
+
+    # Actuation after lease expiry must be rejected with 409
+    test_resp = client.post("/v1/arduino/maintenance/test-led/1", headers=headers)
+    assert test_resp.status_code == 409
+    assert "lease" in test_resp.json()["detail"].lower()
+
+    # But leaving maintenance to safely zero state is always allowed
+    leave_resp = client.post("/v1/arduino/maintenance/leave", headers=headers)
+    assert leave_resp.status_code == 200
+    assert leave_resp.json()["maintenance_mode"] is False
+    assert serial.status()["confirmed_mask"] == 0
+
+
+def test_maintenance_expired_session_cannot_actuate_with_live_lease(tmp_path):
+    settings = Settings(
+        mode="mock",
+        pairing_key="secret",
+        admin_key="admin_secret",
+        session_ttl_seconds=0.05,
+        lease_ttl_seconds=2.0,
+    )
+    serial = SimulatedSerial()
+    pipeline = Pipeline(settings, serial=serial, safe_startup=True)
+    client = TestClient(create_app(settings, pipeline=pipeline, config_path=tmp_path / "app_config.json"))
+    headers = _admin_headers(client)
+
+    assert client.post("/v1/arduino/maintenance/enter", headers=headers).status_code == 200
+    time.sleep(0.1)
+
+    response = client.post("/v1/arduino/maintenance/test-led/1", headers=headers)
+    assert response.status_code == 401
+    assert serial.status()["requested_mask"] == 0
+    assert serial.status()["confirmed_mask"] == 0
+
+
+def test_admin_takeover_during_maintenance_resets_safe_state(tmp_path):
+    settings = Settings(mode="mock", pairing_key="secret", admin_key="admin_secret")
+    serial = SimulatedSerial()
+    pipeline = Pipeline(settings, serial=serial, safe_startup=True)
+    client = TestClient(create_app(settings, pipeline=pipeline, config_path=tmp_path / "app_config.json"))
+
+    # Admin 1 acquires lease and enters maintenance with LED 2 on
+    admin1 = client.post("/v1/sessions", headers={"X-Admin-Key": "admin_secret"}, json={"device_id": "adm1", "role": "admin"}).json()
+    h1 = {"X-Session-Id": admin1["session_id"], "X-Session-Ticket": admin1["ticket"]}
+    client.post("/v1/sessions/lease/takeover", headers=h1)
+    client.post("/v1/arduino/maintenance/enter", headers=h1)
+    client.post("/v1/arduino/maintenance/test-led/2?duration=2.0", headers=h1)
+    assert serial.status()["confirmed_mask"] == 4
+
+    # Admin 2 performs takeover
+    admin2 = client.post("/v1/sessions", headers={"X-Admin-Key": "admin_secret"}, json={"device_id": "adm2", "role": "admin"}).json()
+    h2 = {"X-Session-Id": admin2["session_id"], "X-Session-Ticket": admin2["ticket"]}
+    takeover = client.post("/v1/sessions/lease/takeover", headers=h2)
+    assert takeover.status_code == 200
+
+    # Safety invariant: takeover must cancel maintenance timer and zero Arduino mask
+    assert serial.status()["requested_mask"] == 0
+    assert serial.status()["confirmed_mask"] == 0
+
+
+class RecordingBlockingSerial(SimulatedSerial):
+    def __init__(self):
+        super().__init__()
+        self.history: list[tuple[int, float]] = []
+        self.block_event = threading.Event()
+        self.entered_event = threading.Event()
+        self.should_block = False
+
+    def send_mask(self, mask: int, retries: int = 2, expected_generation: int | None = None) -> bool:
+        if self.should_block:
+            self.should_block = False
+            self.entered_event.set()
+            self.block_event.wait(timeout=5.0)
+        self.history.append((mask, time.monotonic()))
+        return super().send_mask(mask, retries, expected_generation)
+
+
+@pytest.mark.parametrize("fence_type", ["takeover", "leaseexpiry", "leave", "sourceswitch"])
+def test_maintenance_deterministic_barrier_queued_nonzero_vs_fence(tmp_path, fence_type):
+    from concurrent.futures import ThreadPoolExecutor
+
+    lease_ttl = 0.3 if fence_type == "leaseexpiry" else 30.0
+    settings = Settings(mode="mock", pairing_key="secret", admin_key="admin_secret", lease_ttl_seconds=lease_ttl)
+    serial = RecordingBlockingSerial()
+    pipeline = Pipeline(settings, serial=serial, safe_startup=True)
+    app = create_app(settings, pipeline=pipeline, config_path=tmp_path / "app_config.json")
+
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=3) as executor:
+        # Admin 1 acquires lease and enters maintenance
+        admin1 = client.post(
+            "/v1/sessions",
+            headers={"X-Admin-Key": "admin_secret"},
+            json={"device_id": "adm1", "role": "admin"},
+        ).json()
+        h1 = {"X-Session-Id": admin1["session_id"], "X-Session-Ticket": admin1["ticket"]}
+        client.post("/v1/sessions/lease/takeover", headers=h1)
+        client.post("/v1/arduino/maintenance/enter", headers=h1)
+
+        # 1. Start command 1 in background: all-off (mask 0) blocks hardware_worker inside send_mask
+        serial.should_block = True
+        fut1 = executor.submit(
+            lambda: client.post("/v1/arduino/maintenance/all-off", headers=h1)
+        )
+        assert serial.entered_event.wait(timeout=3.0), "Command 1 did not enter send_mask"
+
+        # 2. Queue command 2 (non-zero mask) while hardware_worker is blocked
+        fut2 = executor.submit(
+            lambda: client.post("/v1/arduino/maintenance/test-led/3?duration=1.0", headers=h1)
+        )
+        # Brief pause to ensure ASGI task reaches hardware_worker submission
+        time.sleep(0.05)
+
+        # 3. Trigger fence while command 2 is queued
+        fence_time = time.monotonic()
+        if fence_type == "takeover":
+            admin2 = client.post(
+                "/v1/sessions",
+                headers={"X-Admin-Key": "admin_secret"},
+                json={"device_id": "adm2", "role": "admin"},
+            ).json()
+            h2 = {"X-Session-Id": admin2["session_id"], "X-Session-Ticket": admin2["ticket"]}
+            res = client.post("/v1/sessions/lease/takeover", headers=h2)
+            assert res.status_code == 200
+        elif fence_type == "leaseexpiry":
+            # Wait for lease to expire past lease_ttl (0.3s)
+            time.sleep(0.35)
+        elif fence_type == "leave":
+            res = client.post("/v1/arduino/maintenance/leave", headers=h1)
+            assert res.status_code == 200
+        elif fence_type == "sourceswitch":
+            res = client.post("/v1/camera/sources/active", headers=h1, json={"source_id": "operator_device"})
+            assert res.status_code == 200
+
+        # 4. Now unblock command 1
+        serial.block_event.set()
+
+        # Both commands finish
+        resp1 = fut1.result(timeout=5.0)
+        resp2 = fut2.result(timeout=5.0)
+
+        # Command 2 was queued before fence, so when hardware_worker picked it up,
+        # it was guarded and rejected with 409
+        assert resp2.status_code == 409, f"Expected 409 for queued command after {fence_type}, got {resp2.status_code}"
+
+        # 5. Assert recorded serial writes: NO non-zero writes occurred after fence_time
+        writes_after_fence = [mask for mask, ts in serial.history if ts >= fence_time]
+        assert all(mask == 0 for mask in writes_after_fence), (
+            f"Expected no non-zero writes after {fence_type} fence, but got: {writes_after_fence}"
+        )
 

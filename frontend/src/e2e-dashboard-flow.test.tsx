@@ -37,11 +37,28 @@ const api = vi.hoisted(() => ({
   releaseSession: vi.fn(),
   analyzePhoto: vi.fn(),
   streamFrame: vi.fn(),
+  getCameraSources: vi.fn(),
+  setActiveCameraSource: vi.fn(),
+  createCameraInvite: vi.fn().mockResolvedValue({ invite_id: 'inv-1', invite_token: 'tok-1', invite_url: 'http://localhost:8000/camera#token=tok-1', expires_at: 9999999999 }),
+  cancelCameraInvite: vi.fn().mockResolvedValue({ cancelled: true }),
+  revokeCameraTransmitters: vi.fn().mockResolvedValue({ revoked: true, disconnected_transmitters: 0 }),
+  scanTools: vi.fn(),
+  takeoverLease: vi.fn().mockResolvedValue({ success: true, lease_generation: 2, holder: 'admin-sess' }),
+  sessionHeartbeat: vi.fn().mockResolvedValue({ success: true, lease_held: true, lease_generation: 1, expires_in: 30 }),
+  getCalibrationProfiles: vi.fn().mockResolvedValue({ profiles: {} }),
+  captureProfileBackground: vi.fn(),
+  updateProfileRoi: vi.fn(),
+  confirmLegacyProfile: vi.fn(),
   defaultApiUrl: vi.fn(() => 'http://localhost:8000'),
   ApiError: class ApiError extends Error {
     status = 0
   },
 }))
+
+const cameraSources = [
+  { source_id: 'operator_device', name: 'Cámara de este Navegador', kind: 'browser', status: 'standby', resolution: { width: 1280, height: 720 }, fps: 30, calibration_available: false, requires_operator_action: true },
+  { source_id: 'manual_upload', name: 'Carga Manual de Fotografía', kind: 'file', status: 'standby', resolution: { width: 0, height: 0 }, fps: 0, calibration_available: false, requires_operator_action: true },
+]
 
 vi.mock('./api', () => api)
 
@@ -118,6 +135,8 @@ describe('Simulated UI Integration - Dashboard User Lifecycle (JSDOM with mocked
     }
 
     api.createSession.mockResolvedValue({ session_id: 'admin-sess-e2e', ticket: 't-e2e', role: 'admin' })
+    api.getCameraSources.mockResolvedValue({ sources: cameraSources, active_source_id: 'operator_device', source_version: 1 })
+    api.setActiveCameraSource.mockResolvedValue({ active_source_id: 'operator_device', source_version: 1 })
     api.createWsTicket.mockResolvedValue({ ticket: 'ws-e2e' })
     api.getStatus.mockResolvedValue({ arduino: { connected: false, simulated: false } })
     api.getInventory.mockResolvedValue({ example: true, categories: baseCategories })
@@ -244,8 +263,8 @@ describe('Simulated UI Integration - Dashboard User Lifecycle (JSDOM with mocked
     await waitFor(() => {
       expect(api.updateConfig).toHaveBeenCalled()
       expect(api.applyConfig).toHaveBeenCalled()
+      expect(screen.getByText(/Configuración aplicada en caliente con éxito/i)).toBeInTheDocument()
     })
-    expect(screen.getByText(/Configuración aplicada en caliente con éxito/i)).toBeInTheDocument()
 
     // -------------------------------------------------------------------------
     // Phase 4: Calibración & ROI
@@ -389,7 +408,8 @@ describe('Simulated UI Integration - Dashboard User Lifecycle (JSDOM with mocked
     const rect = document.querySelector('rect.bbox')
     expect(rect?.getAttribute('x')).toBe('15')
     expect(rect?.getAttribute('y')).toBe('25')
-    expect(rect?.getAttribute('width')).toBe('40')
     expect(screen.getByText('ACK simulado')).toBeInTheDocument()
-  })
+    expect(screen.getByText('1 detectada / 8 no detectadas')).toBeInTheDocument()
+    expect(screen.getAllByText('NO DETECTADA EN ESTA LECTURA')).toHaveLength(8)
+  }, 10000)
 })

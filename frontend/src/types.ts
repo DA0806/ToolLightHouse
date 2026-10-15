@@ -226,3 +226,68 @@ export interface ArduinoLedTestResponse {
 }
 
 export type ActiveTab = 'inspection' | 'tools' | 'calibration' | 'arduino' | 'system'
+
+export type CameraSourceKind = 'webrtc' | 'opencv' | 'browser' | 'file'
+export type CameraSourceStatus = 'active' | 'standby' | 'disconnected' | 'error' | 'needs_calibration'
+
+/** Canonical wire shape returned by GET /v1/camera/sources. */
+export interface BackendCameraSourceDescriptor {
+  source_id: string
+  display_name: string
+  kind: 'webrtc_remote' | 'opencv_builtin' | 'opencv_usb' | 'browser_local' | 'manual_upload' | string
+  connection_type: 'webrtc' | 'builtin' | 'usb' | 'browser' | 'file' | string
+  status: CameraSourceStatus | string
+  current_resolution: { width: number; height: number }
+  current_fps: number
+  is_active: boolean
+  calibration_profile_available: boolean
+  last_error?: string | null
+}
+
+export interface CameraSourceDescriptor {
+  source_id: string
+  name: string
+  kind: CameraSourceKind
+  status: CameraSourceStatus
+  resolution: { width: number; height: number }
+  fps: number
+  requires_operator_action: boolean
+  calibration_available: boolean
+  connection_type?: string
+  is_active?: boolean
+  last_error?: string | null
+}
+
+export interface CameraSourcesResponse {
+  sources: CameraSourceDescriptor[]
+  active_source_id: string
+  source_version: number
+}
+
+export interface CameraInviteResponse {
+  invite_id: string
+  invite_token: string
+  invite_url: string
+  expires_at: number
+}
+
+export interface CalibrationProfile {
+  source_id: string
+  resolution: { width: number; height: number }
+  orientation: string
+  crop?: [number, number, number, number] | null
+  processing_version?: number
+  background_filename?: string | null
+  roi?: [number, number, number, number] | null
+  calibrated_at?: number | null
+  status: 'ready' | 'needs_calibration' | 'incompatible' | 'needs_confirmation' | 'unbound_legacy' | string
+  needs_confirmation?: boolean
+}
+
+export interface ActivityLogItem {
+  id: string
+  time: string
+  message: string
+  type: 'info' | 'success' | 'warning' | 'error'
+  dedupeKey?: string
+}

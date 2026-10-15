@@ -68,11 +68,11 @@ def test_health_responds_while_serial_ack_is_blocked():
         def __init__(self):
             super().__init__()
             self.entered, self.finish = threading.Event(), threading.Event()
-        def send_mask(self, mask, retries=2):
+        def send_mask(self, mask, retries=2, expected_generation=None):
             if mask:
                 self.entered.set()
                 self.finish.wait(1.5)
-            return super().send_mask(mask, retries)
+            return super().send_mask(mask, retries, expected_generation)
     serial = BlockedSerial()
     config = settings()
     with TestClient(create_app(config, Pipeline(config, serial=serial))) as client, ThreadPoolExecutor() as executor:

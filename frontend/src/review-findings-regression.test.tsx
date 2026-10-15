@@ -6,7 +6,6 @@ import type { Credentials } from './api'
 import { ArduinoPanel } from './components/ArduinoPanel'
 import { CalibrationView } from './components/CalibrationView'
 import { ToolManager } from './components/ToolManager'
-// @ts-expect-error Node fs used for static CSS regression check in Vitest
 import fs from 'node:fs'
 import type { ArduinoStatus, ConfigResponse, WsEvent } from './types'
 
@@ -43,6 +42,18 @@ const api = vi.hoisted(() => ({
   releaseSession: vi.fn(),
   analyzePhoto: vi.fn(),
   streamFrame: vi.fn(),
+  getCameraSources: vi.fn(),
+  setActiveCameraSource: vi.fn(),
+  createCameraInvite: vi.fn().mockResolvedValue({ invite_id: 'inv-1', invite_token: 'tok-1', invite_url: 'http://localhost:8000/camera#token=tok-1', expires_at: 9999999999 }),
+  cancelCameraInvite: vi.fn().mockResolvedValue({ cancelled: true }),
+  revokeCameraTransmitters: vi.fn().mockResolvedValue({ revoked: true, disconnected_transmitters: 0 }),
+  scanTools: vi.fn(),
+  takeoverLease: vi.fn().mockResolvedValue({ success: true, lease_generation: 2, holder: 'admin-sess' }),
+  sessionHeartbeat: vi.fn().mockResolvedValue({ success: true, lease_held: true, lease_generation: 1, expires_in: 30 }),
+  getCalibrationProfiles: vi.fn().mockResolvedValue({ profiles: {} }),
+  captureProfileBackground: vi.fn(),
+  updateProfileRoi: vi.fn(),
+  confirmLegacyProfile: vi.fn(),
   defaultApiUrl: vi.fn(() => 'http://localhost:8000'),
   ApiError: class ApiError extends Error {
     status: number
@@ -52,6 +63,12 @@ const api = vi.hoisted(() => ({
     }
   },
 }))
+
+const cameraSources = [
+  { source_id: 'remote_phone', name: 'Teléfono Remoto (WebRTC)', kind: 'webrtc', status: 'standby', resolution: { width: 1920, height: 1080 }, fps: 30, calibration_available: false, requires_operator_action: false },
+  { source_id: 'operator_device', name: 'Cámara de este Navegador', kind: 'browser', status: 'standby', resolution: { width: 1280, height: 720 }, fps: 30, calibration_available: false, requires_operator_action: true },
+]
+let activeSourceId = 'remote_phone'
 
 vi.mock('./api', () => api)
 
@@ -109,6 +126,12 @@ describe('Simulated UI Integration - Review Findings Regressions (JSDOM with moc
     api.releaseSession.mockResolvedValue(undefined)
     api.getCalibration.mockResolvedValue({ calibrated: false, status: 'missing', image: null, roi: null })
     api.getArduinoPorts.mockResolvedValue({ ports: [{ port: 'COM3', description: 'Arduino Nano' }] })
+    activeSourceId = 'remote_phone'
+    api.getCameraSources.mockImplementation(() => Promise.resolve({ sources: cameraSources, active_source_id: activeSourceId, source_version: 1 }))
+    api.setActiveCameraSource.mockImplementation((_url: string, _credentials: Credentials, sourceId: string) => {
+      activeSourceId = sourceId
+      return Promise.resolve({ active_source_id: sourceId, source_version: 1 })
+    })
 
     Object.defineProperty(navigator, 'mediaDevices', {
       configurable: true,
@@ -146,9 +169,14 @@ describe('Simulated UI Integration - Review Findings Regressions (JSDOM with moc
       expect(screen.getByText(/Sesión administrativa · Control total del sistema/i)).toBeInTheDocument()
     })
 
+    const select = await screen.findByLabelText('Fuente de Video')
+    await screen.findByRole('option', { name: /Cámara de este Navegador/i })
+    fireEvent.change(select, { target: { value: 'operator_device' } })
+    await waitFor(() => expect(api.setActiveCameraSource).toHaveBeenCalledWith(expect.any(String), expect.anything(), 'operator_device'))
+
     // Click "Abrir cámara"
     const openCamBtn = screen.getByRole('button', { name: 'Abrir cámara' })
-    expect(openCamBtn).not.toBeDisabled()
+    await waitFor(() => expect(openCamBtn).not.toBeDisabled())
     fireEvent.click(openCamBtn)
 
     await waitFor(() => {
@@ -205,7 +233,7 @@ describe('Simulated UI Integration - Review Findings Regressions (JSDOM with moc
       expect(screen.getByText(/Modo de mantenimiento activo/i)).toBeInTheDocument()
     })
     expect(screen.getByRole('button', { name: 'Abrir cámara' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Analizar foto' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Escanear Cámara Remota' })).toBeDisabled()
 
     // Switch to Arduino tab - maintenance state must survive!
     const arduinoNavs = screen.getAllByRole('button', { name: /Arduino/i })
