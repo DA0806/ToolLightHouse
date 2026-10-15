@@ -180,11 +180,21 @@ Verifique que `CUDA disponible: True` y que se reporte el nombre del dispositivo
 
 ### 6.1 Inicio del Servidor
 
-En la laptop servidora, abra PowerShell en la raíz del proyecto e inicie el backend con soporte SSL/TLS:
+En la laptop servidora, abra PowerShell en la raíz del proyecto. Se recomienda utilizar el lanzador oficial interactivo `scripts/start-demo.ps1`, el cual solicita las claves de forma segura en memoria mediante `Read-Host -AsSecureString` y valida certificados y puertos:
 
 ```powershell
-$env:TOOLLIGHTHOUSE_PAIRING_KEY = "operador123"
-$env:TOOLLIGHTHOUSE_ADMIN_KEY = "admin123"
+# Lanzador seguro interactivo:
+.\scripts\start-demo.ps1
+```
+
+Si prefiere iniciar manualmente mediante CLI, configure las variables de entorno de forma interactiva para evitar que queden registradas en el historial de PowerShell:
+
+```powershell
+$secPair = Read-Host -Prompt "Clave de Operador (Tablet)" -AsSecureString
+$env:TOOLLIGHTHOUSE_PAIRING_KEY = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPair))
+
+$secAdmin = Read-Host -Prompt "Clave de Administrador" -AsSecureString
+$env:TOOLLIGHTHOUSE_ADMIN_KEY = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secAdmin))
 
 .\.venv\Scripts\python.exe -m toollighthouse serve `
     --mode real `
@@ -201,8 +211,8 @@ $env:TOOLLIGHTHOUSE_ADMIN_KEY = "admin123"
 ### 6.2 Acceso al Dashboard
 
 1. **Desde la Tablet Operadora (Recomendado):**
-   Navegue a `https://<IP-LAN-LAPTOP>:8000/`.
-   Ingrese la clave de emparejamiento (`operador123` para rol `controller`, o `admin123` para rol `admin`).
+   Navegue a la URL indicada por el lanzador (`https://<IP-LAN-LAPTOP>:8000/`).
+   Ingrese la clave de emparejamiento para rol `controller`, o la clave de administración para rol `admin`.
 2. **Desde la Propia Laptop:**
    Abra en su navegador `https://127.0.0.1:8000/` o `https://localhost:8000/`.
 

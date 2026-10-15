@@ -155,7 +155,12 @@ def test_cli_serve_uses_saved_real_config_and_enters_safe_preparation(monkeypatc
 
     monkeypatch.setattr("uvicorn.run", fake_run)
     assert main(["serve", "--config", str(config_file), "--pairing-key", "serve-secret", "--host", "127.0.0.1", "--port", "8123"]) == 0
-    assert captured["kwargs"] == {"host": "127.0.0.1", "port": 8123}
+    assert captured["kwargs"] == {
+        "host": "127.0.0.1",
+        "port": 8123,
+        "log_level": "warning",
+        "access_log": False,
+    }
 
 
 def test_cli_serve_passes_validated_tls_files(monkeypatch, tmp_path):
