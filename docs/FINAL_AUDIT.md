@@ -6,6 +6,7 @@
 **Commits integrados en la entrega:**
 1. `f61675e` - *fix(core): audit findings for multicamera streaming, serial lease fences, and pipeline freshness*
 2. `6c1ff14` - *feat(demo-ops): implement Windows preflight, secure demo launcher, cert helper fixes, and operational docs* (cherry-pick de `audit/demo-ops` @ `add60ca16df45204fb324a5ec748d378483809bd`)
+3. `edb35ef` - *fix(preflight): preserve CUDA probe on PowerShell 5* (cherry-pick de `audit/demo-ops` @ `f5307fcc7587aa869ad6c574c51ccd0b0d072622`)
 
 ---
 
@@ -34,8 +35,8 @@ Todas las suites fueron ejecutadas directamente en el árbol de trabajo consolid
 
 ### A. Suite Completa Backend (Pytest)
 - **Comando:** `.venv\Scripts\python.exe -m pytest -q`
-- **Resultado:** **258 pasadas, 1 omitida** (493 advertencias de deprecación controladas en FastAPI/Starlette) en **101.85 s**.
-- **Desglose:** 236 pruebas del núcleo funcional + 22 pruebas operacionales/CLI integradas de `audit/demo-ops`.
+- **Resultado:** **259 pasadas, 1 omitida** (493 advertencias de deprecación controladas en FastAPI/Starlette) en **110.12 s**.
+- **Desglose:** 236 pruebas del núcleo funcional + 23 pruebas operacionales/CLI integradas de `audit/demo-ops`.
 - **Prueba omitida:** `tests/test_embedder_gemma.py::test_embedding_gemma_real_weights` (esperado: requiere hardware GPU real y pesos locales cargados en sesión dedicada).
 
 ### B. Suite Focalizada de Seguridad y Concurrencia (Serial / Arduino / Stream / Adversarial)
@@ -53,7 +54,7 @@ Todas las suites fueron ejecutadas directamente en el árbol de trabajo consolid
 
 ### D. Sintaxis y AST de Scripts Operativos en Windows PowerShell 5.1
 - **Comando:** `.venv\Scripts\python.exe -m pytest -q tests/test_demo_ops_scripts.py`
-- **Resultado:** **18 pasadas** en **36.93 s**.
+- **Resultado:** **19 pasadas** en **53.27 s**.
 - **Cobertura:** Validación del Abstract Syntax Tree (AST) sin errores de sintaxis en `scripts/network_helpers.ps1`, `scripts/preflight.ps1`, `scripts/setup_certs.ps1` y `scripts/start-demo.ps1`. Incluye pruebas de resolución de IP LAN, filtrado de interfaces virtuales, envelopes de configuración, validación de certificados y arranque interactivo seguro.
 
 ### E. Verificaciones de Calidad de Código y Dependencias
@@ -63,11 +64,11 @@ Todas las suites fueron ejecutadas directamente en el árbol de trabajo consolid
 
 ### F. Diagnóstico Preflight No Destructivo en Windows
 - **Comando:** `powershell -ExecutionPolicy Bypass -File scripts\preflight.ps1`
-- **Resultado:** **7 PASS, 5 WARN, 1 FAIL**.
+- **Resultado:** **8 PASS, 4 WARN, 1 FAIL**.
+- **Hardware/software GPU verificado durante este preflight:** NVIDIA GeForce RTX 3060 con PyTorch CUDA disponible; el probe se ejecuta por stdin para conservar las comillas en PowerShell 5.1.
 - **Bloqueador real identificado:**
   - `[FAIL] TLS Certificate: Missing lan-cert.pem or lan-key.pem`: Se requiere ejecutar `.\scripts\setup_certs.ps1` previo al evento para habilitar HTTPS en la LAN y permitir `getUserMedia` en navegadores móviles.
 - **Advertencias operacionales legítimas (condiciones de sala):**
-  - Entorno local actual ejecutando PyTorch en CPU (la evidencia de GPU RTX 3060 fue validada offline separadamente).
   - Inventario de 9 herramientas configurado con plantilla base pendiente de confirmación física de casillas.
   - Activo de calibración ROI (`data/calibration/roi.json`) ausente (se genera al capturar bandeja vacía).
   - Perfil de red 'Public' y ausencia de regla pasiva en firewall (se documenta comando de configuración en guía).
