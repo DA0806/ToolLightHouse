@@ -32,11 +32,48 @@ export interface Credentials {
 
 export class ApiError extends Error {
   status: number
-  constructor(message: string, status = 0) {
+  code?: string
+  constructor(message: string, status = 0, code?: string) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
   }
+}
+
+export function parseErrorBody(parsed: unknown, status: number): { message: string; code?: string } {
+  let message = `HTTP ${status}`
+  let code: string | undefined = undefined
+  if (typeof parsed === 'object' && parsed !== null) {
+    const obj = parsed as Record<string, unknown>
+    if (typeof obj.code === 'string') {
+      code = obj.code
+    }
+    if (typeof obj.detail === 'string') {
+      message = obj.detail
+    } else if (typeof obj.detail === 'object' && obj.detail !== null) {
+      const detailObj = obj.detail as Record<string, unknown>
+      if (typeof detailObj.code === 'string') {
+        code = detailObj.code
+      }
+      if (typeof detailObj.message === 'string') {
+        message = detailObj.message
+      } else if (typeof detailObj.detail === 'string') {
+        message = detailObj.detail
+      } else {
+        try {
+          message = JSON.stringify(obj.detail)
+        } catch {
+          message = String(obj.detail)
+        }
+      }
+    } else if (typeof obj.message === 'string') {
+      message = obj.message
+    }
+  } else if (typeof parsed === 'string' && parsed.trim().length > 0) {
+    message = parsed
+  }
+  return { message, code }
 }
 
 export function normalizeApiUrl(url: string): string {
@@ -68,10 +105,8 @@ async function request<T>(url: string, init: RequestInit, timeoutMs: number): Pr
     let parsed: unknown = null
     try { parsed = body ? JSON.parse(body) : null } catch { parsed = body }
     if (!response.ok) {
-      const detail = typeof parsed === 'object' && parsed && 'detail' in parsed
-        ? String((parsed as { detail: unknown }).detail)
-        : `HTTP ${response.status}`
-      throw new ApiError(detail, response.status)
+      const { message, code } = parseErrorBody(parsed, response.status)
+      throw new ApiError(message, response.status, code)
     }
     return parsed as T
   } catch (error) {
@@ -136,15 +171,18 @@ export function analyzePhoto(baseUrl: string, credentials: Credentials, file: Bl
 export function streamFrame(
   baseUrl: string,
   credentials: Credentials,
-  file: Blob,
+  file?: Blob,
   timeoutMs = 12000,
-  sourceContext?: { sourceId?: string; sourceVersion?: number },
+  sourceContext?: { sourceId?: string; sourceVersion?: number; streamRun?: number },
 ): Promise<{ accepted: boolean; frame_id: string; latest_only: boolean; result?: AnalysisResponse }> {
   const body = new FormData()
-  body.append('file', file, file instanceof File ? file.name : 'stream.jpg')
+  if (file) {
+    body.append('file', file, file instanceof File ? file.name : 'stream.jpg')
+  }
   const headers = new Headers(authHeaders(credentials))
   if (sourceContext?.sourceId) headers.set('X-Source-Id', sourceContext.sourceId)
   if (sourceContext?.sourceVersion !== undefined) headers.set('X-Source-Version', String(sourceContext.sourceVersion))
+  if (sourceContext?.streamRun !== undefined) headers.set('X-Stream-Run', String(sourceContext.streamRun))
   return request(`${normalizeApiUrl(baseUrl)}/v1/stream/frame`, { method: 'POST', headers, body }, timeoutMs)
 }
 
@@ -505,10 +543,8 @@ export async function scanTools(baseUrl: string, credentials: Credentials, file?
     let parsed: unknown = null
     try { parsed = body ? JSON.parse(body) : null } catch { parsed = body }
     if (!response.ok) {
-      const detail = typeof parsed === 'object' && parsed && 'detail' in parsed
-        ? String((parsed as { detail: unknown }).detail)
-        : `HTTP ${response.status}`
-      throw new ApiError(detail, response.status)
+      const { message, code } = parseErrorBody(parsed, response.status)
+      throw new ApiError(message, response.status, code)
     }
     return parsed as AnalysisResponse
   } catch (error) {
@@ -527,11 +563,38 @@ export function takeoverLease(baseUrl: string, credentials: Credentials, timeout
   }, timeoutMs)
 }
 
-export function sessionHeartbeat(baseUrl: string, credentials: Credentials, timeoutMs = 5000): Promise<{ success: boolean; lease_held: boolean; lease_generation: number; expires_in: number }> {
-  return request<{ success: boolean; lease_held: boolean; lease_generation: number; expires_in: number }>(`${normalizeApiUrl(baseUrl)}/v1/sessions/heartbeat`, {
-    method: 'POST',
-    headers: authHeaders(credentials),
-  }, timeoutMs)
+export function sessionHeartbeat(
+  baseUrl: string,
+  credentials: Credentials,
+  timeoutMs = 5000,
+): Promise<{ success: boolean; alive: boolean; lease_held: boolean; lease_generation: number; expires_in: number }> {
+  return request<{ success: boolean; alive: boolean; lease_held: boolean; lease_generation: number; expires_in: number }>(
+    `${normalizeApiUrl(baseUrl)}/v1/sessions/heartbeat`,
+    {
+      method: 'POST',
+      headers: authHeaders(credentials),
+    },
+    timeoutMs,
+  )
+}
+
+export function stopStream(
+  baseUrl: string,
+  credentials: Credentials,
+  timeoutMs = 5000,
+  sourceContext?: { sourceId?: string; sourceVersion?: number; streamRun?: number },
+): Promise<{ stopped: boolean; stream_generation: number }> {
+  const headers = new Headers(authHeaders(credentials))
+  if (sourceContext?.sourceId) headers.set('X-Source-Id', sourceContext.sourceId)
+  if (sourceContext?.sourceVersion !== undefined) headers.set('X-Source-Version', String(sourceContext.sourceVersion))
+  if (sourceContext?.streamRun !== undefined) headers.set('X-Stream-Run', String(sourceContext.streamRun))
+  return request<{ stopped: boolean; stream_generation: number }>(
+    `${normalizeApiUrl(baseUrl)}/v1/stream/stop`,
+    {
+      method: 'POST', headers,
+    },
+    timeoutMs,
+  )
 }
 
 export function getCalibrationProfiles(baseUrl: string, credentials: Credentials, timeoutMs = 5000): Promise<{ profiles: Record<string, CalibrationProfile> }> {
@@ -558,10 +621,8 @@ export async function captureProfileBackground(baseUrl: string, credentials: Cre
     let parsed: unknown = null
     try { parsed = body ? JSON.parse(body) : null } catch { parsed = body }
     if (!response.ok) {
-      const detail = typeof parsed === 'object' && parsed && 'detail' in parsed
-        ? String((parsed as { detail: unknown }).detail)
-        : `HTTP ${response.status}`
-      throw new ApiError(detail, response.status)
+      const { message, code } = parseErrorBody(parsed, response.status)
+      throw new ApiError(message, response.status, code)
     }
     return parsed as CalibrationProfile
   } catch (error) {

@@ -169,7 +169,9 @@ describe('Simulated UI Integration - Review Findings Regressions (JSDOM with moc
       expect(screen.getByText(/Sesión administrativa · Control total del sistema/i)).toBeInTheDocument()
     })
 
-    fireEvent.change(await screen.findByLabelText('Fuente de Video'), { target: { value: 'operator_device' } })
+    const select = await screen.findByLabelText('Fuente de Video')
+    await screen.findByRole('option', { name: /Cámara de este Navegador/i })
+    fireEvent.change(select, { target: { value: 'operator_device' } })
     await waitFor(() => expect(api.setActiveCameraSource).toHaveBeenCalledWith(expect.any(String), expect.anything(), 'operator_device'))
 
     // Click "Abrir cámara"

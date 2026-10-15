@@ -126,3 +126,94 @@ def test_heartbeat_renewal():
     # Reader cannot heartbeat for physical lease
     reader = store.create("dev-reader", "reader")
     assert store.heartbeat(reader.session_id, reader.ticket) is False
+
+
+def test_heartbeat_api_preserves_auth_when_lease_lost(tmp_path):
+    from fastapi.testclient import TestClient
+    from toollighthouse.api import create_app
+
+    settings = Settings(mode="mock", pairing_key="secret", admin_key="admin_secret", lease_ttl_seconds=0.2)
+    client = TestClient(create_app(settings, config_path=tmp_path / "app_config.json"))
+
+    # Controller creates session and holds lease initially
+    ctrl = client.post(
+        "/v1/sessions",
+        headers={"X-Pairing-Key": "secret"},
+        json={"device_id": "phone-1", "role": "controller"},
+    ).json()
+    headers = {"X-Session-Id": ctrl["session_id"], "X-Session-Ticket": ctrl["ticket"]}
+
+    # Heartbeat while lease is active
+    hb1 = client.post("/v1/sessions/heartbeat", headers=headers)
+    assert hb1.status_code == 200
+    assert hb1.json()["alive"] is True
+    assert hb1.json()["lease_held"] is True
+
+    # Wait for lease to expire
+    time.sleep(0.3)
+
+    # Heartbeat after lease expired must succeed with 200, alive: True, lease_held: False (preserving auth!)
+    hb2 = client.post("/v1/sessions/heartbeat", headers=headers)
+    assert hb2.status_code == 200
+    payload = hb2.json()
+    assert payload["alive"] is True
+    assert payload["lease_held"] is False
+    assert payload["expires_in"] > 0
+
+    # True 401 only on invalid ticket or missing session
+    bad_hb1 = client.post("/v1/sessions/heartbeat", headers={"X-Session-Id": ctrl["session_id"], "X-Session-Ticket": "wrong"})
+    assert bad_hb1.status_code == 401
+    bad_hb2 = client.post("/v1/sessions/heartbeat", headers={"X-Session-Id": "nonexistent", "X-Session-Ticket": "x"})
+    assert bad_hb2.status_code == 401
+
+
+def test_role_failure_returns_403_not_401(tmp_path):
+    from fastapi.testclient import TestClient
+    from toollighthouse.api import create_app
+
+    settings = Settings(mode="mock", pairing_key="secret", admin_key="admin_secret")
+    client = TestClient(create_app(settings, config_path=tmp_path / "app_config.json"))
+
+    # Reader creates valid session
+    reader = client.post(
+        "/v1/sessions",
+        headers={"X-Pairing-Key": "secret"},
+        json={"device_id": "reader-dev", "role": "reader"},
+    ).json()
+    headers = {"X-Session-Id": reader["session_id"], "X-Session-Ticket": reader["ticket"]}
+
+    # Reader attempting controller action must get 403 Forbidden, NOT 401
+    photo_resp = client.post(
+        "/v1/analyze/photo",
+        headers=headers,
+        files={"file": ("photo.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 20, "image/jpeg")},
+    )
+    assert photo_resp.status_code == 403
+    assert "controller or admin role required" in photo_resp.json()["detail"].lower()
+
+
+def test_lease_expiration_returns_409_not_401(tmp_path):
+    from fastapi.testclient import TestClient
+    from toollighthouse.api import create_app
+
+    settings = Settings(mode="mock", pairing_key="secret", admin_key="admin_secret", lease_ttl_seconds=0.2)
+    client = TestClient(create_app(settings, config_path=tmp_path / "app_config.json"))
+
+    ctrl = client.post(
+        "/v1/sessions",
+        headers={"X-Pairing-Key": "secret"},
+        json={"device_id": "phone-1", "role": "controller"},
+    ).json()
+    headers = {"X-Session-Id": ctrl["session_id"], "X-Session-Ticket": ctrl["ticket"]}
+
+    # Wait for lease to expire
+    time.sleep(0.3)
+
+    # Controller action with expired lease must return 409 Conflict, NOT 401 Unauthorized
+    resp = client.post(
+        "/v1/analyze/photo",
+        headers=headers,
+        files={"file": ("photo.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 20, "image/jpeg")},
+    )
+    assert resp.status_code == 409
+    assert "lease expired" in resp.json()["detail"].lower()

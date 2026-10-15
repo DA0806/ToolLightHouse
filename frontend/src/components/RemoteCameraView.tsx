@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { Smartphone, Video, VideoOff, Wifi, WifiOff, AlertTriangle, ShieldCheck } from 'lucide-react'
 import { defaultApiUrl, websocketUrl } from '../api'
+import { createVideoFreshnessState, waitForFreshVideoFrame, type VideoFreshnessState } from '../videoFreshness'
 
 function invitationTokenFromLocation(): string {
   const hash = window.location.hash
@@ -29,6 +30,7 @@ export function RemoteCameraView() {
   const transmitterIdRef = useRef<string>('')
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([])
   const isUploadingRef = useRef<boolean>(false)
+  const videoFreshnessRef = useRef<VideoFreshnessState>(createVideoFreshnessState())
 
   // Consume the invitation atomically so React StrictMode cannot erase the token
   // before the second effect setup reads it.
@@ -76,6 +78,7 @@ export function RemoteCameraView() {
         isUploadingRef.current = true
         try {
           const video = videoRef.current
+          await waitForFreshVideoFrame(video, videoFreshnessRef.current)
           const vw = video.videoWidth || 640
           const vh = video.videoHeight || 480
           const maxW = 1280
@@ -125,8 +128,14 @@ export function RemoteCameraView() {
             'image/jpeg',
             0.8
           )
-        } catch {
+        } catch (caught) {
           isUploadingRef.current = false
+          const message = caught instanceof Error ? caught.message : 'El vídeo no ha recibido un fotograma nuevo. Comprueba la cámara o reconecta el teléfono.'
+          setErrorMsg(message)
+          if (fallbackIntervalRef.current) {
+            clearInterval(fallbackIntervalRef.current)
+            fallbackIntervalRef.current = null
+          }
         }
       }, 500) // 500ms = 2 FPS bounded
     },
@@ -185,6 +194,7 @@ export function RemoteCameraView() {
           return
         }
         streamRef.current = stream
+        videoFreshnessRef.current = createVideoFreshnessState()
         if (videoRef.current) {
           videoRef.current.srcObject = stream
           void videoRef.current.play().catch(() => {})
@@ -333,6 +343,7 @@ export function RemoteCameraView() {
         streamRef.current.getTracks().forEach((track) => track.stop())
         streamRef.current = null
       }
+      videoFreshnessRef.current = createVideoFreshnessState()
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close()
       }

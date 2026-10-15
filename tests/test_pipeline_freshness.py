@@ -33,9 +33,9 @@ class RecordingSerial(SimulatedSerial):
         super().__init__()
         self.sent = []
 
-    def send_mask(self, mask, retries=2):
+    def send_mask(self, mask, retries=2, expected_generation=None):
         self.sent.append(mask)
-        return super().send_mask(mask, retries)
+        return super().send_mask(mask, retries, expected_generation)
 
 
 def _pipeline(embedder, *, frame_max_age=1.0, prediction_max_age=10.0, prediction_interval=0.0, batch_size=9, confirmations=2):

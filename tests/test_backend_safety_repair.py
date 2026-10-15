@@ -47,10 +47,10 @@ class _RecordingSerial(SimulatedSerial):
         self.masks = []
         self._masks_lock = threading.Lock()
 
-    def send_mask(self, mask: int, retries: int = 2) -> bool:
+    def send_mask(self, mask: int, retries: int = 2, expected_generation: int | None = None) -> bool:
         with self._masks_lock:
             self.masks.append(mask)
-        return super().send_mask(mask, retries)
+        return super().send_mask(mask, retries, expected_generation)
 
 
 class _DelayedNonzeroPipeline(Pipeline):

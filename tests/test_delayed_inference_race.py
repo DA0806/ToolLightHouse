@@ -25,7 +25,9 @@ def _admin_headers(client, admin_key="admin_secret"):
         headers={"X-Admin-Key": admin_key},
         json={"device_id": "test_runner", "role": "admin"},
     ).json()
-    return {"X-Session-Id": session["session_id"], "X-Session-Ticket": session["ticket"]}
+    headers = {"X-Session-Id": session["session_id"], "X-Session-Ticket": session["ticket"]}
+    client.post("/v1/sessions/lease/takeover", headers=headers)
+    return headers
 
 
 class SlowInferencePipeline(Pipeline):
@@ -173,11 +175,11 @@ def test_delayed_blocking_serial_keeps_event_loop_responsive(tmp_path):
             self.send_mask_started = threading.Event()
             self.send_mask_unblock = threading.Event()
 
-        def send_mask(self, mask: int, retries: int = 2) -> bool:
+        def send_mask(self, mask: int, retries: int = 2, expected_generation: int | None = None) -> bool:
             if mask != 0:
                 self.send_mask_started.set()
                 self.send_mask_unblock.wait(timeout=1.0)
-            return super().send_mask(mask, retries)
+            return super().send_mask(mask, retries, expected_generation)
 
     slow_serial = SlowSerial()
     settings = Settings(mode="mock", pairing_key="secret", admin_key="admin_secret")

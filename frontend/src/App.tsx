@@ -21,6 +21,7 @@ import {
   scanTools,
   setActiveCameraSource,
   sessionHeartbeat,
+  stopStream,
   streamFrame,
   takeoverLease,
   updateConfig,
@@ -49,6 +50,7 @@ import { CalibrationView } from './components/CalibrationView'
 import { ArduinoPanel } from './components/ArduinoPanel'
 import { SystemPanel } from './components/SystemPanel'
 import { CameraSelector } from './components/CameraSelector'
+import { createVideoFreshnessState, waitForFreshVideoFrame, type VideoFreshnessState } from './videoFreshness'
 import { QRModal } from './components/QRModal'
 import { RemoteCameraView } from './components/RemoteCameraView'
 import './styles.css'
@@ -56,6 +58,122 @@ import './styles.css'
 const DEVICE_KEY = 'toollighthouse.device-id'
 const URL_KEY = 'toollighthouse.api-url'
 const MAX_RECONNECT_ATTEMPTS = 5
+
+export function isTrueAuthorityLoss(status: number, message?: string, code?: string): boolean {
+  if (status !== 409) return false
+  if (code) {
+    const normCode = code.toLowerCase().trim()
+    if (['lease_lost', 'lease_expired', 'controller_conflict', 'authority_loss'].includes(normCode)) {
+      return true
+    }
+  }
+  if (!message) return false
+  const lower = message.toLowerCase().trim()
+  const exactPatterns = [
+    'controller lease expired',
+    'another controller session is active',
+    'controller lease expired during inference',
+    'physical control lease required for maintenance operations',
+    'current active physical control lease required to alter camera settings',
+    'physical control lease lost',
+    'lease revoked',
+  ]
+  return exactPatterns.some((pattern) => lower.includes(pattern))
+}
+
+export function mapActionableErrorMessage(error: unknown): string {
+  if (!error) return 'Error desconocido'
+  if (typeof error === 'string') return error
+  const status = error instanceof ApiError ? error.status : (error as { status?: number }).status
+  const message = error instanceof Error ? error.message : String(error)
+  const code = error instanceof ApiError ? error.code : (error as { code?: string }).code
+  const lower = message.toLowerCase()
+  const lowerCode = code?.toLowerCase() || ''
+
+  if (status === 401) {
+    return 'La sesión expiró o es inválida. Empareja de nuevo.'
+  }
+
+  if (status === 403) {
+    return 'Permisos insuficientes para realizar esta operación.'
+  }
+
+  if (isTrueAuthorityLoss(status ?? 0, message, code)) {
+    return 'El control físico fue tomado por otro operador o expiró.'
+  }
+
+  if (lowerCode === 'inference_discarded' || lower.includes('inference result discarded')) {
+    return 'La lectura fue descartada porque cambió la escena o la configuración. Repite el análisis con la fuente activa.'
+  }
+
+  if (lowerCode === 'stream_stale' || lower.includes('stream run was stopped') || lower.includes('newer stream run is active')) {
+    return 'La ejecución continua anterior ya terminó. Activa nuevamente el modo continuo.'
+  }
+
+  if (
+    lowerCode === 'source_stale' ||
+    lower.includes('stream source is not active') ||
+    lower.includes('photo source is not active') ||
+    lower.includes('stream source version is stale') ||
+    lower.includes('photo source version is stale') ||
+    lower.includes('source changed during intake') ||
+    lower.includes('scene changed')
+  ) {
+    return 'La fuente de cámara cambió o está desactualizada. Selecciona la cámara activa nuevamente.'
+  }
+
+  if (
+    lowerCode === 'calibration_incompatible' ||
+    lowerCode === 'calibration_missing' ||
+    lower.includes('calibration profile is incompatible') ||
+    lower.includes('no calibration background available') ||
+    lower.includes('background calibration is in progress') ||
+    lower.includes('calibration superseded')
+  ) {
+    return 'La calibración de la bandeja no coincide con la resolución o está en progreso. Recalibra la fuente.'
+  }
+
+  if (
+    lowerCode === 'preparation_mode' ||
+    lower.includes('preparation mode') ||
+    lower.includes('gallery missing') ||
+    lower.includes('gallery unavailable')
+  ) {
+    return 'El sistema está en modo preparación. Ve a Calibración para guardar fondo/ROI y preparar la galería (las fotos de referencia son opcionales).'
+  }
+
+  if (
+    lowerCode === 'maintenance_active' ||
+    lower.includes('hardware is in maintenance mode') ||
+    lower.includes('must enter maintenance mode')
+  ) {
+    return 'El hardware se encuentra en modo mantenimiento. Sal de mantenimiento para reanudar el análisis.'
+  }
+
+  if (
+    lowerCode === 'stale_frame' ||
+    lower.includes('stale before queueing') ||
+    lower.includes('webcam is stale') ||
+    lower.includes('superseded by a newer frame') ||
+    lower.includes('stale frame')
+  ) {
+    return 'El fotograma capturado fue descartado por retraso. Se procesará el siguiente fotograma.'
+  }
+
+  if (
+    lowerCode === 'config_busy' ||
+    lower.includes('preparation or apply task is currently running') ||
+    lower.includes('retry after completion')
+  ) {
+    return 'Hay una tarea de configuración en ejecución. Espera un momento y reintenta.'
+  }
+
+  if (status === 429 || lower.includes('rate limit exceeded')) {
+    return 'Límite de velocidad de fotogramas alcanzado. Ajustando tasa de captura.'
+  }
+
+  return message
+}
 
 function appWebsocketUrl(baseUrl: string, path: string): string {
   const parsed = new URL(baseUrl.replace(/\/+$/, ''))
@@ -200,6 +318,10 @@ export default function App() {
   const continuousBusy = useRef(false)
   const latestFrame = useRef<Blob | null>(null)
   const streamGeneration = useRef(0)
+  const activeStreamRun = useRef<number | null>(null)
+  const videoFreshnessRef = useRef<VideoFreshnessState>(createVideoFreshnessState())
+  const streamStopPromiseRef = useRef<Promise<unknown> | null>(null)
+  const streamStopErrorRef = useRef<unknown | null>(null)
   const continuousMode = useRef(false)
   const previewUrl = useRef<string | null>(null)
   const viewerRef = useRef<HTMLDivElement>(null)
@@ -226,6 +348,19 @@ export default function App() {
   draftConfigRef.current = draftConfig
 
   const canControl = session?.role === 'controller' || session?.role === 'admin'
+
+  const cleanupRemotePeer = useCallback(() => {
+    remoteStreamRef.current?.getTracks().forEach((track) => track.stop())
+    remoteStreamRef.current = null
+    peerConnectionRef.current?.close()
+    peerConnectionRef.current = null
+  }, [])
+
+  const cleanupRemoteConnection = useCallback(() => {
+    cleanupRemotePeer()
+    signalingWsRef.current?.close()
+    signalingWsRef.current = null
+  }, [cleanupRemotePeer])
 
   const observeVideoStream = useCallback((stream: MediaStream) => {
     const video = videoRef.current
@@ -505,16 +640,25 @@ export default function App() {
             reconnectTimer.current = null
             if (!mounted.current || !sessionRef.current) return
             void getStatus(apiUrl, credentials, 4000).then(() => connectSocket(credentials)).catch((caught) => {
-              if (caught instanceof ApiError && (caught.status === 401 || caught.status === 409)) {
-                invalidateSessionRef.current('La sesión expiró. Empareja el teléfono de nuevo.')
+              if (caught instanceof ApiError && caught.status === 401) {
+                invalidateSessionRef.current('La sesión expiró. Empareja de nuevo.')
+              } else if (caught instanceof ApiError && caught.status === 409) {
+                if (isTrueAuthorityLoss(caught.status, caught.message, caught.code)) {
+                  setLeaseMessage('El control físico fue tomado por otro operador o expiró.')
+                  setContinuous(false)
+                }
               } else if (mounted.current) connectSocket(credentials)
             })
           }, 1500)
         }
       })
     }).catch((caught) => {
-      if (caught instanceof ApiError && (caught.status === 401 || caught.status === 409)) invalidateSessionRef.current('La sesión expiró. Empareja el teléfono de nuevo.')
-      else if (mounted.current) setError(caught instanceof Error ? caught.message : 'No se pudo abrir el canal de eventos')
+      if (caught instanceof ApiError && caught.status === 401) invalidateSessionRef.current('La sesión expiró. Empareja de nuevo.')
+      else if (caught instanceof ApiError && caught.status === 409) {
+        if (isTrueAuthorityLoss(caught.status, caught.message, caught.code)) {
+          setLeaseMessage('El control físico fue tomado por otro operador o expiró.')
+        }
+      } else if (mounted.current) setError(mapActionableErrorMessage(caught))
     })
   }, [apiUrl, handleEvent])
 
@@ -559,7 +703,7 @@ export default function App() {
       sessionRef.current = null
       setSession(null)
       setConnection('error')
-      setError(caught instanceof ApiError && caught.status === 409 ? 'Otro teléfono ya controla el Arduino. Libera esa sesión antes de conectar.' : caught instanceof Error ? caught.message : 'No se pudo conectar')
+      setError(caught instanceof ApiError && caught.status === 409 ? 'Otro operador/dispositivo ya controla el Arduino. Libera esa sesión antes de conectar.' : caught instanceof Error ? caught.message : 'No se pudo conectar')
     }
   }
 
@@ -604,7 +748,7 @@ export default function App() {
       streamGeneration.current += 1
       cameraStream.current?.getTracks().forEach((track) => track.stop())
       cameraStream.current = null
-      remoteStreamRef.current = null
+      cleanupRemoteConnection()
       if (videoRef.current) videoRef.current.srcObject = null
       setCameraOn(false)
       setContinuous(false)
@@ -651,6 +795,9 @@ export default function App() {
     if (!session || typeof revokeCameraTransmitters !== 'function') return
     try {
       const res = await revokeCameraTransmitters(apiUrl, session)
+      cleanupRemotePeer()
+      setCameraOn(false)
+      setObservedVideo(null)
       logActivity(`Transmisores revocados: ${res.disconnected_transmitters}`, 'warning')
       setLeaseMessage('Transmisores desconectados y revocados.')
     } catch (err: any) {
@@ -679,7 +826,16 @@ export default function App() {
     if (!session || (session.role !== 'controller' && session.role !== 'admin') || typeof sessionHeartbeat !== 'function') return
     const current = session
     const timer = setInterval(() => {
-      void sessionHeartbeat(apiUrl, current).catch(() => {})
+      void sessionHeartbeat(apiUrl, current).then((res) => {
+        if (res && res.lease_held === false) {
+          setLeaseMessage('El control físico fue tomado por otro operador o expiró.')
+          setContinuous(false)
+        }
+      }).catch((caught) => {
+        if (caught instanceof ApiError && caught.status === 401) {
+          invalidateSessionRef.current('La sesión expiró. Empareja de nuevo.')
+        }
+      })
     }, 4500)
     return () => clearInterval(timer)
   }, [apiUrl, session])
@@ -687,15 +843,7 @@ export default function App() {
   // WebRTC Operator Signaling for remote_phone
   useEffect(() => {
     if (!session || !canControl || activeSourceId !== 'remote_phone') {
-      if (signalingWsRef.current) {
-        signalingWsRef.current.close()
-        signalingWsRef.current = null
-      }
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close()
-        peerConnectionRef.current = null
-      }
-      remoteStreamRef.current = null
+      cleanupRemoteConnection()
       if (videoRef.current && !cameraStream.current) videoRef.current.srcObject = null
       setTransmitterConnected(false)
       if (!cameraStream.current) {
@@ -745,6 +893,7 @@ export default function App() {
               if (!active) return
               if (event.streams[0]) {
                 remoteStreamRef.current = event.streams[0]
+                videoFreshnessRef.current = createVideoFreshnessState()
                 if (videoRef.current) {
                   videoRef.current.srcObject = event.streams[0]
                   void videoRef.current.play().catch(() => {})
@@ -783,7 +932,7 @@ export default function App() {
             }
           } else if (msg.type === 'peer_disconnected') {
             setTransmitterConnected(false)
-            remoteStreamRef.current = null
+            cleanupRemotePeer()
             if (videoRef.current) videoRef.current.srcObject = null
             setCameraOn(false)
             setObservedVideo(null)
@@ -804,17 +953,14 @@ export default function App() {
     return () => {
       active = false
       if (ws) ws.close()
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close()
-        peerConnectionRef.current = null
-      }
-      remoteStreamRef.current = null
+      cleanupRemotePeer()
+      if (signalingWsRef.current === ws) signalingWsRef.current = null
       pendingCandidates = []
       if (videoRef.current && !cameraStream.current) videoRef.current.srcObject = null
       setTransmitterConnected(false)
       setCameraOn(false)
     }
-  }, [activeSourceId, apiUrl, canControl, logActivity, observeVideoStream, session])
+  }, [activeSourceId, apiUrl, canControl, cleanupRemoteConnection, cleanupRemotePeer, logActivity, observeVideoStream, session])
 
   // Backend Binary Preview WebSocket for OpenCV and remote fallback sources.
   useEffect(() => {
@@ -915,17 +1061,49 @@ export default function App() {
     setDraftConfig(next)
   }, [])
 
-  const stopCamera = useCallback(() => {
+  const stopCamera = useCallback((preserveRemote = false) => {
     cameraRequestGeneration.current += 1
     streamGeneration.current += 1
     latestFrame.current = null
+    videoFreshnessRef.current = createVideoFreshnessState()
     continuousBusy.current = false
     cameraStream.current?.getTracks().forEach((track) => track.stop())
     cameraStream.current = null
+    if (!preserveRemote) cleanupRemoteConnection()
     if (videoRef.current) videoRef.current.srcObject = null
     setObservedVideo(null)
     setCameraOn(false); setContinuous(false)
-  }, [])
+  }, [cleanupRemoteConnection])
+
+  const requestStreamStop = useCallback((credentials: Credentials, sourceContext?: { sourceId?: string; sourceVersion?: number; streamRun?: number }) => {
+    if (streamStopPromiseRef.current) return streamStopPromiseRef.current
+    streamStopErrorRef.current = null
+    const request = stopStream(apiUrl, credentials, 5000, sourceContext).then(
+      (result) => {
+        streamStopErrorRef.current = null
+        return result
+      },
+      (caught) => {
+        streamStopErrorRef.current = caught
+        throw caught
+      },
+    )
+    streamStopPromiseRef.current = request
+    void request.finally(() => {
+      if (streamStopPromiseRef.current === request) streamStopPromiseRef.current = null
+    }).catch(() => undefined)
+    return request
+  }, [apiUrl])
+
+  const stopContinuousForAction = useCallback(async () => {
+    const activeRun = activeStreamRun.current
+    const wasContinuous = continuousMode.current || activeRun !== null
+    continuousMode.current = false
+    streamGeneration.current += 1
+    setContinuous(false)
+    const credentials = sessionRef.current
+    if (credentials && wasContinuous) await requestStreamStop(credentials, { sourceId: activeSourceId, sourceVersion: sourceVersion ?? undefined, streamRun: activeRun ?? undefined })
+  }, [activeSourceId, requestStreamStop, sourceVersion])
 
   const invalidateSession = useCallback((message: string) => {
     sessionGeneration.current += 1
@@ -965,8 +1143,15 @@ export default function App() {
 
   const chooseImage = async (file?: File) => {
     if (!file) return
+    try {
+      await stopContinuousForAction()
+      if (streamStopErrorRef.current) throw streamStopErrorRef.current
+    } catch (caught) {
+      setError(mapActionableErrorMessage(caught))
+      return
+    }
     sceneGeneration.current += 1
-    setContinuous(false); latestFrame.current = null
+    latestFrame.current = null
     setError(''); setAnalysis(null)
     try {
       const next = await normalizeCapture(file)
@@ -978,6 +1163,12 @@ export default function App() {
   const captureFromVideo = async (): Promise<Blob | null> => {
     const video = videoRef.current
     if (!video || !video.videoWidth) return null
+    try {
+      await waitForFreshVideoFrame(video, videoFreshnessRef.current)
+    } catch (caught) {
+      setError(mapActionableErrorMessage(caught))
+      return null
+    }
     const canvas = document.createElement('canvas')
     canvas.width = video.videoWidth; canvas.height = video.videoHeight
     canvas.getContext('2d')?.drawImage(video, 0, 0)
@@ -992,6 +1183,8 @@ export default function App() {
     const requestSceneGeneration = sceneGeneration.current
     setBusy(true); setError('')
     try {
+      if (streamStopErrorRef.current) throw streamStopErrorRef.current
+      if (streamStopPromiseRef.current) await streamStopPromiseRef.current
       if (activeSourceId === 'laptop_builtin' || activeSourceId === 'usb_webcam' || activeSourceId === 'remote_phone') {
         const backendCaptureSource = activeSourceId === 'laptop_builtin' || activeSourceId === 'usb_webcam'
         const fallbackBlob = blob || backendPreviewBlob
@@ -1015,10 +1208,16 @@ export default function App() {
       }
     }
     catch (caught) {
-      if (caught instanceof ApiError && (caught.status === 401 || caught.status === 409)) {
-        invalidateSession('La sesión dejó de tener control. Vuelve a emparejar el teléfono.')
+      if (caught instanceof ApiError && caught.status === 401) {
+        invalidateSession('La sesión expiró o es inválida. Empareja de nuevo.')
+      } else if (caught instanceof ApiError && caught.status === 409) {
+        if (isTrueAuthorityLoss(caught.status, caught.message, caught.code)) {
+          setLeaseMessage('El control físico fue tomado por otro operador o expiró.')
+          setContinuous(false)
+          stopCamera()
+        }
       }
-      setError(caught instanceof Error ? caught.message : 'No se pudo analizar la foto')
+      setError(mapActionableErrorMessage(caught))
     } finally { setBusy(false) }
   }
 
@@ -1031,7 +1230,30 @@ export default function App() {
       return
     }
     if (selectedSource.kind !== 'browser') {
-      setError('La cámara de esta pantalla solo está disponible al seleccionar la fuente operator_device.')
+      if (selectedSource.source_id === 'remote_phone' && transmitterConnected) {
+        const existingRemote = remoteStreamRef.current
+        const liveRemote = existingRemote?.getVideoTracks?.().some((track) => track.readyState !== 'ended')
+          ? existingRemote
+          : (() => {
+            const tracks = peerConnectionRef.current?.getReceivers?.().map((receiver) => receiver.track).filter((track) => track && track.readyState !== 'ended') || []
+            return tracks.length ? new MediaStream(tracks) : null
+          })()
+        if (liveRemote) {
+          remoteStreamRef.current = liveRemote
+          videoFreshnessRef.current = createVideoFreshnessState()
+          if (videoRef.current) {
+            videoRef.current.srcObject = liveRemote
+            void videoRef.current.play().catch(() => {})
+          }
+          observeVideoStream(liveRemote)
+          setError('')
+          setCameraOn(true)
+          return
+        }
+      }
+      setError(selectedSource.source_id === 'remote_phone'
+        ? 'La cámara remota no está conectada. Usa Vincular Celular (QR) para recuperar la transmisión.'
+        : 'La cámara de esta pantalla solo está disponible al seleccionar la fuente operator_device.')
       return
     }
     const requestGeneration = ++cameraRequestGeneration.current
@@ -1045,6 +1267,7 @@ export default function App() {
         stream.getTracks().forEach((track) => track.stop())
         return
       }
+      videoFreshnessRef.current = createVideoFreshnessState()
       cameraStream.current = stream; setCameraOn(true)
       observeVideoStream(stream)
     } catch { setError('La cámara requiere HTTPS o localhost y permiso del navegador. También puedes elegir una foto.') }
@@ -1082,40 +1305,62 @@ export default function App() {
           } : next)
         }
       }).catch((caught) => {
-        if (caught instanceof ApiError && (caught.status === 401 || caught.status === 409)) invalidateSession('La sesión expiró. Empareja el teléfono de nuevo.')
+        if (caught instanceof ApiError && caught.status === 401) {
+          invalidateSession('La sesión expiró. Empareja el teléfono de nuevo.')
+        } else if (caught instanceof ApiError && caught.status === 409) {
+          if (isTrueAuthorityLoss(caught.status, caught.message, caught.code)) {
+            setLeaseMessage('El control físico fue tomado por otro operador o expiró.')
+            setContinuous(false)
+            stopCamera()
+          }
+        }
       })
     }, 2000)
     return () => window.clearInterval(poll)
-  }, [apiUrl, invalidateSession, session])
+  }, [apiUrl, invalidateSession, session, stopCamera])
 
   useEffect(() => {
     continuousMode.current = continuous
     const backendSource = activeSourceId === 'laptop_builtin' || activeSourceId === 'usb_webcam'
     const remoteFallbackSource = activeSourceId === 'remote_phone' && !cameraOn
     if (!continuous || !session || (!cameraOn && !backendSource && !remoteFallbackSource)) return
+    const effectSession = session
     const runGeneration = ++streamGeneration.current
+    activeStreamRun.current = runGeneration
     let stopped = false
     let active = false
-    let pending: Blob | null = null
+    let pending: Blob | boolean | null = null
     const dispatch = async () => {
       if (stopped || active || !pending || !sessionRef.current) return
       active = true; continuousBusy.current = true
       const submitted = pending; pending = null; latestFrame.current = null
       const requestSession = sessionRef.current
       try {
-        const response = await streamFrame(apiUrl, requestSession, submitted, 12000, {
+        const payloadBlob = typeof submitted === 'object' && submitted instanceof Blob ? submitted : undefined
+        const response = await streamFrame(apiUrl, requestSession, payloadBlob, 12000, {
           sourceId: activeSourceId,
           sourceVersion: sourceVersion ?? undefined,
+          streamRun: runGeneration,
         })
         if (!stopped && runGeneration === streamGeneration.current && sessionRef.current === requestSession && response.result) {
           const result = response.result
-          void acceptResult(result, submitted, () => mounted.current && !stopped && runGeneration === streamGeneration.current && sessionRef.current === requestSession)
+          void acceptResult(result, payloadBlob, () => mounted.current && !stopped && runGeneration === streamGeneration.current && sessionRef.current === requestSession)
         }
       } catch (caught) {
         if (!stopped && runGeneration === streamGeneration.current && mounted.current) {
-          if (caught instanceof ApiError && (caught.status === 401 || caught.status === 409)) {
-            sessionRef.current = null; setSession(null); setConnection('error'); setLeaseMessage('La sesión expiró. Empareja el teléfono de nuevo.'); stopCamera()
-          } else setError(caught instanceof Error ? caught.message : 'El modo continuo perdió la conexión')
+          if (caught instanceof ApiError && caught.status === 401) {
+            invalidateSession('La sesión expiró. Empareja el teléfono de nuevo.')
+          } else if (caught instanceof ApiError && caught.status === 409) {
+            if (isTrueAuthorityLoss(caught.status, caught.message, caught.code)) {
+              setLeaseMessage('El control físico fue tomado por otro operador o expiró.')
+              setContinuous(false)
+              stopCamera()
+            } else {
+              setError(mapActionableErrorMessage(caught))
+            }
+          } else {
+            setError(mapActionableErrorMessage(caught))
+          }
         }
       } finally {
         active = false; continuousBusy.current = false
@@ -1124,11 +1369,33 @@ export default function App() {
     }
     const interval = window.setInterval(() => {
       if (stopped) return
-      const capture = cameraOn ? captureFromVideo() : Promise.resolve(backendPreviewBlobRef.current)
-      void capture.then((blob) => { if (blob && !stopped) { pending = blob; latestFrame.current = blob; void dispatch() } })
+      if (backendSource) {
+        pending = true
+        void dispatch()
+      } else {
+        const capture = cameraOn ? captureFromVideo() : Promise.resolve(backendPreviewBlobRef.current)
+        void capture.then((blob) => {
+          if (blob && !stopped) { pending = blob; latestFrame.current = blob; void dispatch() }
+        }).catch((caught) => {
+          if (stopped || !mounted.current) return
+          setError(mapActionableErrorMessage(caught))
+          continuousMode.current = false
+          setContinuous(false)
+          void requestStreamStop(effectSession, { sourceId: activeSourceId, sourceVersion: sourceVersion ?? undefined, streamRun: runGeneration }).catch(() => {})
+        })
+      }
     }, 500)
-    return () => { stopped = true; streamGeneration.current += 1; pending = null; latestFrame.current = null; active = false; window.clearInterval(interval) }
-  }, [acceptResult, activeSourceId, apiUrl, cameraOn, continuous, session, sourceVersion, stopCamera])
+    return () => {
+      stopped = true
+      streamGeneration.current += 1
+      pending = null
+      latestFrame.current = null
+      active = false
+      window.clearInterval(interval)
+      void requestStreamStop(effectSession, { sourceId: activeSourceId, sourceVersion: sourceVersion ?? undefined, streamRun: runGeneration }).catch(() => {})
+      if (activeStreamRun.current === runGeneration) activeStreamRun.current = null
+    }
+  }, [acceptResult, activeSourceId, apiUrl, cameraOn, continuous, invalidateSession, requestStreamStop, session, sourceVersion, stopCamera])
 
   const simulation = analysis?.simulated || analysis?.arduino.simulated || Boolean(status?.arduino?.simulated)
   const imageWidth = analysis?.image.width || preview?.width || 1
@@ -1160,6 +1427,10 @@ export default function App() {
 
   const detectedCount = toolSlots.filter((t) => t.isStored).length
   const notDetectedCount = toolSlots.length - detectedCount
+  const remoteResumeAvailable = activeSourceId === 'remote_phone' && transmitterConnected && Boolean(
+    remoteStreamRef.current?.getVideoTracks?.().some((track) => track.readyState !== 'ended') ||
+    peerConnectionRef.current?.getReceivers?.().some((receiver) => receiver.track && receiver.track.readyState !== 'ended'),
+  )
 
   const ledItems = useMemo(() => Array.from({ length: 9 }, (_, bit) => {
     const item = inventory.find((candidate, index) => (candidate.led_index ?? candidate.bit ?? index) === bit)
@@ -1232,8 +1503,8 @@ export default function App() {
           </div>
           <div className="capture-row">
             <label className="button button-primary"><span aria-hidden="true">↥</span> Elegir foto<input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; void chooseImage(file) }} /></label>
-            <button className="button button-secondary" onClick={() => cameraOn ? stopCamera() : void startCamera()} disabled={!canControl || Boolean(status?.maintenance_mode) || (!cameraOn && cameraSources.find((source) => source.source_id === activeSourceId)?.kind !== 'browser')}>{cameraOn ? 'Cerrar cámara' : 'Abrir cámara'}</button>
-            {cameraOn && <button className="button button-accent button-purple" onClick={() => void captureFromVideo().then((blob) => { if (!blob) return; const width = videoRef.current?.videoWidth || 1; const height = videoRef.current?.videoHeight || 1; setPreviewSafely({ blob, url: URL.createObjectURL(blob), width, height }); stopCamera(); void inspect(blob) })} disabled={busy || !canControl || Boolean(status?.maintenance_mode)}>Analizar toma</button>}
+            <button className="button button-secondary" onClick={() => cameraOn ? stopCamera() : void startCamera()} disabled={!canControl || Boolean(status?.maintenance_mode) || (!cameraOn && cameraSources.find((source) => source.source_id === activeSourceId)?.kind !== 'browser' && !remoteResumeAvailable)}>{cameraOn ? 'Cerrar cámara' : 'Abrir cámara'}</button>
+            {cameraOn && <button className="button button-accent button-purple" onClick={() => void captureFromVideo().then(async (blob) => { if (!blob) return; const width = videoRef.current?.videoWidth || 1; const height = videoRef.current?.videoHeight || 1; setPreviewSafely({ blob, url: URL.createObjectURL(blob), width, height }); await stopContinuousForAction(); stopCamera(activeSourceId === 'remote_phone'); await inspect(blob) }).catch((caught) => setError(mapActionableErrorMessage(caught)))} disabled={busy || !canControl || Boolean(status?.maintenance_mode)}>Analizar toma</button>}
             {!cameraOn && <button className="button button-accent button-purple" onClick={() => void inspect(backendPreviewBlob || preview?.blob)} disabled={busy || (!preview && !backendPreviewBlob && activeSourceId !== 'laptop_builtin' && activeSourceId !== 'usb_webcam' && activeSourceId !== 'remote_phone') || !canControl || Boolean(status?.maintenance_mode)}>{busy ? 'Analizando…' : (activeSourceId === 'laptop_builtin' || activeSourceId === 'usb_webcam') ? 'Escanear Cámara Web' : activeSourceId === 'remote_phone' ? 'Escanear Cámara Remota' : 'Analizar foto'}</button>}
           </div>
             <div className="viewer-tools"><span>Vista del overlay</span><button className={fit === 'contain' ? 'selected' : ''} onClick={() => setFit('contain')}>Completa</button><button className={fit === 'cover' ? 'selected' : ''} onClick={() => setFit('cover')}>Recortada</button><label className="continuous-toggle"><input type="checkbox" checked={continuous} onChange={(e) => setContinuous(e.target.checked)} disabled={!session || (!cameraOn && !backendPreviewBlob && activeSourceId !== 'laptop_builtin' && activeSourceId !== 'usb_webcam')} /> Continuo <small>2 FPS</small></label></div>

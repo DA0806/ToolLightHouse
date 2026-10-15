@@ -219,8 +219,20 @@ def create_app(
     hardware_worker = LatestInferenceWorker(lambda operation: operation())
     stream_task: asyncio.Task | None = None
     stream_generation = 0
+    active_stream_runs: dict[str, int] = {}
+    stopped_stream_runs: dict[str, int] = {}
+    last_stream_mono = 0.0
     lease_watchdog: asyncio.Task | None = None
     camera_registry = CameraSourceRegistry(initial_active="remote_phone")
+    if hasattr(active_settings, "camera_sources") and active_settings.camera_sources:
+        for s_id, s_conf in active_settings.camera_sources.items():
+            if isinstance(s_conf, dict):
+                camera_registry.update_source_status(
+                    s_id,
+                    "active" if s_id == camera_registry.active_source_id else "standby",
+                    resolution=s_conf.get("resolution"),
+                    fps=s_conf.get("fps"),
+                )
     invite_store = CameraInviteStore()
     signaling_hub = WebRTCSignalingHub(invite_store, allowed_origins=base_settings.cors_origins)
     opencv_service: OpenCVCameraService | None = None
@@ -291,18 +303,20 @@ def create_app(
             now = time.time()
             if not session or session.expires_at <= now:
                 raise HTTPException(status_code=401, detail="session expired or invalid")
+            if not ticket or not secrets.compare_digest(session.ticket, ticket or ""):
+                raise HTTPException(status_code=401, detail="invalid session ticket")
+
             if session.role in {"controller", "admin"} and store.controller_id == session.session_id and session.lease_expires_at <= now:
                 store.controller_id = None
                 store.lease_generation += 1
                 if role == "controller":
-                    raise HTTPException(status_code=401, detail="controller lease expired")
+                    raise HTTPException(status_code=409, detail="controller lease expired")
             if session.role == "controller" and role == "controller" and store.controller_id != session.session_id:
                 if store.controller_id == session.session_id:
                     store.controller_id = None
                     store.lease_generation += 1
-                raise HTTPException(status_code=401, detail="controller lease expired")
-            if not ticket or not secrets.compare_digest(session.ticket, ticket or ""):
-                raise HTTPException(status_code=401, detail="invalid session ticket")
+                raise HTTPException(status_code=409, detail="controller lease expired")
+
             # Requests must observe an expired *other* controller immediately;
             # relying only on the background watchdog leaves a stale lease
             # blocking the next admin/controller during lightweight ASGI tests
@@ -318,8 +332,6 @@ def create_app(
                 if session.role != "admin":
                     raise HTTPException(status_code=403, detail="admin role required")
             elif role == "controller":
-                if session.role == "reader":
-                    raise HTTPException(status_code=401, detail="controller role required")
                 if session.role not in {"controller", "admin"}:
                     raise HTTPException(status_code=403, detail="controller or admin role required")
                 if store.controller_id not in {None, session.session_id}:
@@ -359,7 +371,32 @@ def create_app(
             )
         )
 
+    def inference_rejection_detail(generation, controller):
+        """Distinguish a lost lease from a deliberately superseded result."""
+        with state_lock:
+            session = store.sessions.get(controller or "")
+            lease_lost = (
+                closed
+                or generation != store.lease_generation
+                or controller != store.controller_id
+                or (
+                    base_settings.auth_required
+                    and (
+                        session is None
+                        or session.expires_at <= time.time()
+                        or session.lease_expires_at <= time.time()
+                    )
+                )
+            )
+        if lease_lost:
+            return {"code": "lease_lost", "message": "physical control lease lost during inference"}
+        return {
+            "code": "inference_discarded",
+            "message": "inference result discarded because the scene, source, configuration, or maintenance state changed",
+        }
+
     def hardware_command(mask, generation, controller, scene, deadline=0.0, captured_at=None, clearing=False):
+        expected_transport_generation = None
         with state_lock:
             if closed or generation != store.lease_generation or scene != scene_generation:
                 return None
@@ -373,9 +410,12 @@ def create_app(
                     session = store.sessions.get(controller)
                     if session:
                         transport_deadline = min(deadline, session.expires_at, session.lease_expires_at)
-                pipeline.serial.set_scene_deadline(transport_deadline)
+                expected_transport_generation = pipeline.serial.set_scene_deadline(transport_deadline)
         started = time.perf_counter()
-        sent = pipeline.serial.send_mask(mask)
+        if expected_transport_generation is None:
+            sent = pipeline.serial.send_mask(mask)
+        else:
+            sent = pipeline.serial.send_mask(mask, expected_generation=expected_transport_generation)
         pipeline.metrics.observe_stage("serial", time.perf_counter() - started)
         status = pipeline.serial.status()
         matched = bool(sent and status.get("confirmed_mask") == mask)
@@ -383,6 +423,37 @@ def create_app(
             pipeline.metrics.observe_ack(captured_at, getattr(pipeline.serial, "last_ack_at", 0), matched, pipeline.serial.simulated)
         with state_lock:
             if closed or generation != store.lease_generation or scene != scene_generation:
+                return None
+        return {**status, "ack": matched}
+
+    def maintenance_hardware_command(mask: int, generation: int, controller: str, scene: int, test_gen: int, target_serial_ref: Any, deadline: float):
+        expected_transport_generation = None
+        with state_lock:
+            if closed or not maintenance_mode or generation != store.lease_generation or scene != scene_generation:
+                return None
+            if store.controller_id != controller or test_generation != test_gen or pipeline.serial is not target_serial_ref:
+                return None
+            if base_settings.auth_required:
+                session = store.sessions.get(controller)
+                if not session or session.expires_at <= time.time() or session.lease_expires_at <= time.time():
+                    return None
+            if hasattr(target_serial_ref, "set_scene_deadline"):
+                transport_deadline = deadline
+                if base_settings.auth_required:
+                    transport_deadline = min(transport_deadline, session.expires_at, session.lease_expires_at)
+                expected_transport_generation = target_serial_ref.set_scene_deadline(transport_deadline)
+        started = time.perf_counter()
+        if expected_transport_generation is None:
+            sent = target_serial_ref.send_mask(mask)
+        else:
+            sent = target_serial_ref.send_mask(mask, expected_generation=expected_transport_generation)
+        pipeline.metrics.observe_stage("serial", time.perf_counter() - started)
+        status = target_serial_ref.status()
+        matched = bool(sent and status.get("confirmed_mask") == mask)
+        with state_lock:
+            if closed or not maintenance_mode or generation != store.lease_generation or scene != scene_generation:
+                return None
+            if store.controller_id != controller or test_generation != test_gen or pipeline.serial is not target_serial_ref:
                 return None
         return {**status, "ack": matched}
 
@@ -394,11 +465,20 @@ def create_app(
                 raise
             return None
 
+    async def maintenance_command(*args, **kwargs):
+        try:
+            return await asyncio.wrap_future(hardware_worker.submit(lambda: maintenance_hardware_command(*args, **kwargs)))
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
+            return None
+
     async def clear_scene(event: str, announce_before_reset: bool = False):
-        nonlocal scene_generation, scene_deadline, scene_mask
+        nonlocal scene_generation, scene_deadline, scene_mask, last_stream_mono
         if announce_before_reset:
             await broadcast({"type": "system", "event": event, "timestamp": time.time()})
         with state_lock:
+            last_stream_mono = 0.0
             scene_generation += 1
             scene_deadline, scene_mask = 0.0, 0
             generation, scene = store.lease_generation, scene_generation
@@ -581,6 +661,8 @@ def create_app(
         session = auth(session_id, x_session_ticket)
         with state_lock:
             store.release(session_id)
+            active_stream_runs.pop(session_id, None)
+            stopped_stream_runs.pop(session_id, None)
         if session and session.role == "controller":
             await clear_scene("controller_released")
         else:
@@ -609,6 +691,13 @@ def create_app(
         session = auth(x_session_id, x_session_ticket, "admin")
 
         async def takeover_teardown(new_gen: int, evicted_controller_id: str | None = None):
+            nonlocal maintenance_mode, led_test_timer, test_generation
+            with state_lock:
+                test_generation += 1
+                if led_test_timer is not None:
+                    led_test_timer.cancel()
+                    led_test_timer = None
+                maintenance_mode = False
             await clear_scene("admin_takeover")
             if evicted_controller_id:
                 await invite_store.revoke_all_for_owner(evicted_controller_id)
@@ -637,20 +726,21 @@ def create_app(
     ):
         if not x_session_id or not x_session_ticket:
             raise HTTPException(status_code=401, detail="Missing session headers")
-        ok = store.heartbeat(x_session_id, x_session_ticket)
-        if not ok:
-            raise HTTPException(status_code=401, detail="Heartbeat rejected or lease lost")
-        session = store.sessions.get(x_session_id)
-        lease_held = bool(store.lease and store.lease.holder_session_id == x_session_id)
-        expires_in = max(
-            0.0,
-            (store.lease.lease_expires_at - time.time())
-            if lease_held and store.lease
-            else (session.expires_at - time.time())
-            if session
-            else 0.0,
-        )
-        return {"alive": True, "lease_held": lease_held, "expires_in": expires_in}
+        with state_lock:
+            session = store.sessions.get(x_session_id)
+            now_wall = time.time()
+            if not session or session.expires_at <= now_wall or not secrets.compare_digest(session.ticket, x_session_ticket):
+                raise HTTPException(status_code=401, detail="session expired or invalid")
+            ok = store.heartbeat(x_session_id, x_session_ticket)
+            session.expires_at = now_wall + store.settings.session_ttl_seconds
+            lease_held = bool(ok and store.lease and store.lease.holder_session_id == x_session_id and store.lease.lease_expires_at > now_wall)
+            expires_in = max(
+                0.0,
+                (store.lease.lease_expires_at - now_wall)
+                if lease_held and store.lease
+                else (session.expires_at - now_wall),
+            )
+            return {"alive": True, "lease_held": lease_held, "expires_in": expires_in}
 
     # -------------------------------------------------------------------------
     # Multicamera Registry & WebRTC Signaling Endpoints
@@ -1100,9 +1190,7 @@ def create_app(
 
         result = await commit_result(result, generation, controller_id, scene, True, current_source, source_version, config_version)
         if result is None:
-            raise HTTPException(
-                status_code=409, detail="controller lease expired during inference"
-            )
+            raise HTTPException(status_code=409, detail=inference_rejection_detail(generation, controller_id))
 
         await broadcast({"type": "detection", "result": result})
         await broadcast({"type": "arduino_ack", "arduino": result["arduino"]})
@@ -2314,9 +2402,16 @@ def create_app(
     @app.post("/v1/arduino/maintenance/enter")
     async def enter_maintenance(x_session_id: str | None = Header(default=None), x_session_ticket: str | None = Header(default=None)):
         nonlocal maintenance_mode
-        auth(x_session_id, x_session_ticket, "admin")
+        session = auth(x_session_id, x_session_ticket, "admin")
+        with state_lock:
+            if store.controller_id != session.session_id:
+                raise HTTPException(status_code=409, detail="physical control lease required for maintenance operations")
         async with lifecycle_lock:
-            maintenance_mode = True
+            with state_lock:
+                store.expire_controller()
+                if store.controller_id != session.session_id:
+                    raise HTTPException(status_code=409, detail="physical control lease required for maintenance operations")
+                maintenance_mode = True
             await clear_scene("maintenance_entered")
             status_info = pipeline.serial.status()
             await broadcast({"type": "system", "event": "maintenance_mode", "maintenance_mode": True, "arduino": status_info})
@@ -2327,13 +2422,17 @@ def create_app(
         nonlocal maintenance_mode, led_test_timer, test_generation
         auth(x_session_id, x_session_ticket, "admin")
         async with lifecycle_lock:
-            test_generation += 1
-            if led_test_timer is not None:
-                led_test_timer.cancel()
-                led_test_timer = None
+            with state_lock:
+                test_generation += 1
+                if led_test_timer is not None:
+                    led_test_timer.cancel()
+                    led_test_timer = None
+                maintenance_mode = False
+                generation = store.lease_generation
+                ctrl = store.controller_id
+                scene = scene_generation
 
-            await asyncio.to_thread(pipeline.serial.send_mask, 0)
-            maintenance_mode = False
+            await command(0, generation, ctrl, scene, clearing=True)
             await clear_scene("maintenance_left")
 
             status_info = pipeline.serial.status()
@@ -2348,7 +2447,7 @@ def create_app(
         x_session_ticket: str | None = Header(default=None),
     ):
         nonlocal app_loop, led_test_timer, test_generation
-        auth(x_session_id, x_session_ticket, "admin")
+        session = auth(x_session_id, x_session_ticket, "admin")
 
         # TestClient and lightweight ASGI hosts may serve requests without
         # running the optional startup hook. Capture the request loop here so
@@ -2358,6 +2457,8 @@ def create_app(
             app_loop = request_loop
 
         with state_lock:
+            if store.controller_id != session.session_id:
+                raise HTTPException(status_code=409, detail="physical control lease required for maintenance operations")
             if not maintenance_mode:
                 raise HTTPException(status_code=409, detail="Must enter maintenance mode before testing LEDs")
             if not 0 <= idx <= 8:
@@ -2369,16 +2470,23 @@ def create_app(
                 led_test_timer.cancel()
                 led_test_timer = None
 
+            generation = store.lease_generation
+            controller = store.controller_id
+            scene = scene_generation
+            target_serial = pipeline.serial
+
         mask = 1 << idx
         effective_duration = min(max(duration, 0.1), 3.0)
-        target_serial = pipeline.serial
+        deadline = time.time() + effective_duration
 
-        if hasattr(target_serial, "set_scene_deadline"):
-            target_serial.set_scene_deadline(time.time() + effective_duration)
-        await asyncio.to_thread(target_serial.send_mask, mask)
-        status_info = target_serial.status()
+        cmd_result = await maintenance_command(
+            mask, generation, controller, scene, current_gen, target_serial, deadline
+        )
+        if cmd_result is None:
+            raise HTTPException(status_code=409, detail="physical control lease or maintenance mode lost")
+        status_info = cmd_result
 
-        def do_auto_off(gen: int, s_ref: Any):
+        def do_auto_off(gen: int, s_ref: Any, scene_at_start: int):
             with state_lock:
                 if not maintenance_mode or gen != test_generation or s_ref is not pipeline.serial:
                     return
@@ -2390,7 +2498,7 @@ def create_app(
             except Exception:
                 pass
             with state_lock:
-                if not maintenance_mode or gen != test_generation or s_ref is not pipeline.serial:
+                if not maintenance_mode or gen != test_generation or s_ref is not pipeline.serial or scene_at_start != scene_generation:
                     return
                 raw_status = s_ref.status()
                 status = {**raw_status, "ack": bool(sent and raw_status.get("confirmed_mask") == 0)}
@@ -2407,7 +2515,7 @@ def create_app(
                 except RuntimeError:
                     pass
 
-        led_test_timer = threading.Timer(effective_duration, do_auto_off, args=[current_gen, target_serial])
+        led_test_timer = threading.Timer(effective_duration, do_auto_off, args=[current_gen, target_serial, scene])
         led_test_timer.daemon = True
         led_test_timer.start()
 
@@ -2422,18 +2530,24 @@ def create_app(
     @app.post("/v1/arduino/maintenance/all-off")
     async def all_off(x_session_id: str | None = Header(default=None), x_session_ticket: str | None = Header(default=None)):
         nonlocal led_test_timer, test_generation
-        auth(x_session_id, x_session_ticket, "admin")
+        session = auth(x_session_id, x_session_ticket, "admin")
 
         with state_lock:
+            if store.controller_id != session.session_id:
+                raise HTTPException(status_code=409, detail="physical control lease required for maintenance operations")
             if not maintenance_mode:
                 raise HTTPException(status_code=409, detail="Must enter maintenance mode before issuing maintenance commands")
             test_generation += 1
             if led_test_timer is not None:
                 led_test_timer.cancel()
                 led_test_timer = None
+            generation = store.lease_generation
+            controller = store.controller_id
+            scene = scene_generation
 
-        await asyncio.to_thread(pipeline.serial.send_mask, 0)
-        status_info = pipeline.serial.status()
+        status_info = await command(0, generation, controller, scene, clearing=True)
+        if status_info is None:
+            status_info = pipeline.serial.status()
         await broadcast({"type": "arduino_ack", "arduino": status_info})
         return {"arduino": status_info}
 
@@ -2502,22 +2616,38 @@ def create_app(
         result["scene_generation"] = scene
         result = await commit_result(result, generation, controller_id, scene, True, source_id, source_version, config_version)
         if result is None:
-            raise HTTPException(status_code=409, detail="controller lease expired during inference")
+            raise HTTPException(status_code=409, detail=inference_rejection_detail(generation, controller_id))
         await broadcast({"type": "detection", "result": result})
         await broadcast({"type": "arduino_ack", "arduino": result["arduino"]})
         return result
 
     @app.post("/v1/stream/frame")
     async def stream_frame(
-        file: UploadFile = File(...),
+        file: UploadFile | None = File(default=None),
         x_session_id: str | None = Header(default=None),
         x_session_ticket: str | None = Header(default=None),
         x_source_id: str | None = Header(default=None),
         x_source_version: str | None = Header(default=None),
+        x_stream_run: str | None = Header(default=None),
     ):
-        nonlocal stream_task, stream_generation
+        nonlocal stream_task, stream_generation, last_stream_mono
         if base_settings.auth_required:
             auth(x_session_id, x_session_ticket, "controller")
+        stream_run = None
+        stream_session = x_session_id or ""
+        if x_stream_run is not None:
+            try:
+                stream_run = int(x_stream_run)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail={"code": "stream_stale", "message": "invalid stream run"}) from exc
+            if stream_run <= 0:
+                raise HTTPException(status_code=409, detail={"code": "stream_stale", "message": "invalid stream run"})
+            with state_lock:
+                if stream_run <= stopped_stream_runs.get(stream_session, 0):
+                    raise HTTPException(status_code=409, detail={"code": "stream_stale", "message": "stream run was stopped"})
+                active_run = active_stream_runs.get(stream_session)
+                if active_run is not None and active_run != stream_run:
+                    raise HTTPException(status_code=409, detail={"code": "stream_stale", "message": "a newer stream run is active"})
         if maintenance_mode:
             raise HTTPException(status_code=409, detail="hardware is in maintenance mode")
         if pipeline.mode == "preparation":
@@ -2528,32 +2658,74 @@ def create_app(
 
         source_id, source_version, lease_generation, controller_id, scene = capture_context()
         config_version = active_version
-        if source_id in {"laptop_builtin", "usb_webcam"} and x_source_id != source_id:
-            raise HTTPException(status_code=409, detail="legacy stream intake requires the active source metadata")
-        if x_source_id is not None and x_source_id != source_id:
-            raise HTTPException(status_code=409, detail="stream source is not active")
-        if x_source_version is not None and str(source_version) != str(x_source_version):
-            raise HTTPException(status_code=409, detail="stream source version is stale")
-        try:
-            image = await _read_image(file, base_settings.max_upload_bytes, base_settings.max_pixels)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Enforce current source id and source version
+        if source_id in {"laptop_builtin", "usb_webcam"}:
+            if x_source_id != source_id:
+                raise HTTPException(status_code=409, detail="stream source is not active")
+            if x_source_version is None or str(source_version) != str(x_source_version):
+                raise HTTPException(status_code=409, detail="stream source version is stale")
+        else:
+            if x_source_id is not None and x_source_id != source_id:
+                raise HTTPException(status_code=409, detail="stream source is not active")
+            if x_source_version is not None and str(source_version) != str(x_source_version):
+                raise HTTPException(status_code=409, detail="stream source version is stale")
+
+        # Backend FPS limit enforcement
+        now_mono = time.monotonic()
+        desc = camera_registry.get_source(source_id)
+        target_fps = float(desc.current_fps) if desc and desc.current_fps > 0 else 30.0
+        min_interval = 1.0 / max(1.0, min(target_fps, 60.0))
+        with state_lock:
+            if last_stream_mono > 0 and (now_mono - last_stream_mono) < (min_interval * 0.9):
+                raise HTTPException(status_code=429, detail="Stream rate limit exceeded")
+            last_stream_mono = now_mono
+
+        # Retrieve pristine buffer for backend source, or decode upload file for browser source
+        if source_id in {"laptop_builtin", "usb_webcam"}:
+            if file is not None:
+                try:
+                    await file.close()
+                except Exception:
+                    pass
+            if opencv_service is None or not opencv_service.is_running:
+                raise HTTPException(status_code=400, detail="Backend camera is not running")
+            latest = opencv_service.get_latest_frame()
+            if latest is None:
+                raise HTTPException(status_code=400, detail="No frame captured from camera yet")
+            raw_img, frame_wall_ts, frame_mono_ts = latest
+            if time.monotonic() - frame_mono_ts > base_settings.frame_max_age_seconds:
+                raise HTTPException(status_code=409, detail="Captured frame from webcam is stale")
+            image = raw_img
+            captured_mono = frame_mono_ts
+            captured_at = frame_wall_ts
+        else:
+            if file is None:
+                raise HTTPException(status_code=400, detail="file is required for stream upload")
+            try:
+                image = await _read_image(file, base_settings.max_upload_bytes, base_settings.max_pixels)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            captured_mono = time.monotonic()
+            captured_at = time.time()
+
         try:
             image = normalize_for_source(image, source_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
         if not context_current(source_id, source_version, config_version):
             raise HTTPException(status_code=409, detail="stream source changed during intake")
 
-        stream_generation += 1
-        generation = stream_generation
+        if time.monotonic() - captured_mono > base_settings.frame_max_age_seconds:
+            raise HTTPException(status_code=409, detail="frame became stale before queueing")
+
         frame_id = str(uuid.uuid4())
-        if stream_task and not stream_task.done():
-            stream_task.cancel()
 
         async def process_latest():
             try:
-                captured_at = time.time()
+                if time.monotonic() - captured_mono > base_settings.frame_max_age_seconds:
+                    return
                 result = await asyncio.wait_for(
                     asyncio.wrap_future(inference_worker.submit(lambda: process_frame(image, captured_at, False, scene))),
                     base_settings.inference_timeout_seconds,
@@ -2562,10 +2734,13 @@ def create_app(
                 if generation == stream_generation and current(lease_generation, controller_id, scene, source_id, source_version, config_version):
                     await clear_scene("inference_timeout")
                 return
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, StaleFrameError):
                 return
             except (ValueError, RuntimeError) as exc:
                 await broadcast({"type": "system", "event": "frame_rejected", "detail": str(exc)})
+                return
+
+            if time.monotonic() - captured_mono > base_settings.frame_max_age_seconds:
                 return
 
             result["frame_id"] = frame_id
@@ -2581,8 +2756,61 @@ def create_app(
             await broadcast({"type": "detection", "result": result})
             await broadcast({"type": "arduino_ack", "arduino": result["arduino"]})
 
-        stream_task = asyncio.create_task(process_latest())
+        with state_lock:
+            if stream_run is not None:
+                if stream_run <= stopped_stream_runs.get(stream_session, 0):
+                    raise HTTPException(status_code=409, detail={"code": "stream_stale", "message": "stream run was stopped during intake"})
+                active_run = active_stream_runs.get(stream_session)
+                if active_run is not None and active_run != stream_run:
+                    raise HTTPException(status_code=409, detail={"code": "stream_stale", "message": "a newer stream run is active"})
+                active_stream_runs[stream_session] = stream_run
+            stream_generation += 1
+            generation = stream_generation
+            if stream_task and not stream_task.done():
+                stream_task.cancel()
+            stream_task = asyncio.create_task(process_latest())
         return {"accepted": True, "latest_only": True, "generation": generation, "frame_id": frame_id, "timestamp": time.time()}
+
+    @app.post("/v1/stream/stop")
+    async def stop_stream(
+        x_session_id: str | None = Header(default=None),
+        x_session_ticket: str | None = Header(default=None),
+        x_source_id: str | None = Header(default=None),
+        x_source_version: str | None = Header(default=None),
+        x_stream_run: str | None = Header(default=None),
+    ):
+        nonlocal stream_task, stream_generation, last_stream_mono
+        if base_settings.auth_required:
+            auth(x_session_id, x_session_ticket, "controller")
+        stream_run = None
+        stream_session = x_session_id or ""
+        if x_stream_run is not None:
+            try:
+                stream_run = int(x_stream_run)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail={"code": "stream_stale", "message": "invalid stream run"}) from exc
+            if stream_run <= 0:
+                raise HTTPException(status_code=409, detail={"code": "stream_stale", "message": "invalid stream run"})
+        current_source, current_source_version = camera_registry.snapshot_active()
+        if x_source_id is not None and x_source_id != current_source:
+            raise HTTPException(status_code=409, detail={"code": "source_stale", "message": "stream stop source is no longer active"})
+        if x_source_version is not None and str(current_source_version) != str(x_source_version):
+            raise HTTPException(status_code=409, detail={"code": "source_stale", "message": "stream stop source version is stale"})
+        with state_lock:
+            if stream_run is not None:
+                active_run = active_stream_runs.get(stream_session)
+                if active_run is not None and active_run != stream_run:
+                    return {"stopped": False, "stream_generation": stream_generation}
+                if stream_run <= stopped_stream_runs.get(stream_session, 0):
+                    return {"stopped": False, "stream_generation": stream_generation}
+                stopped_stream_runs[stream_session] = stream_run
+                active_stream_runs.pop(stream_session, None)
+            stream_generation += 1
+            last_stream_mono = 0.0
+            if stream_task and not stream_task.done():
+                stream_task.cancel()
+        await clear_scene("stream_stopped")
+        return {"stopped": True, "stream_generation": stream_generation}
 
     @app.websocket("/v1/ws")
     async def websocket(websocket: WebSocket, session_id: str | None = None, ticket: str | None = None):

@@ -30,18 +30,35 @@ if (!["localhost", "127.0.0.1", "::1"].includes(parsedUrl.hostname)) {
 }
 
 try {
-  const statusRes = await fetch(`${baseUrl}/v1/status`);
-  if (statusRes.ok) {
-    const statusData = await statusRes.json();
-    if (statusData.mode === "real" || (statusData.arduino && statusData.arduino.connected && !statusData.arduino.simulated)) {
-      throw new Error("review-loopback is restricted to isolated mock backends; detected real mode or physical hardware");
+  let statusRes = await fetch(`${baseUrl}/v1/status`);
+  if (statusRes.status === 401) {
+    // Fail-closed authenticated check: create session to verify mock mode
+    const authRes = await fetch(`${baseUrl}/v1/sessions`, {
+      method: "POST",
+      headers: { "X-Pairing-Key": pairingKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ device_id: "review-guard", role: "reader" }),
+    });
+    if (!authRes.ok) {
+      throw new Error(`review-loopback security guard failed: cannot authenticate with pairing key (HTTP ${authRes.status})`);
     }
+    const sess = await authRes.json();
+    statusRes = await fetch(`${baseUrl}/v1/status`, {
+      headers: { "X-Session-Id": sess.session_id, "X-Session-Ticket": sess.ticket },
+    });
+  }
+  if (!statusRes.ok) {
+    throw new Error(`review-loopback security guard failed: status returned HTTP ${statusRes.status}`);
+  }
+  const statusData = await statusRes.json();
+  const currentMode = statusData.pipeline_mode || statusData.mode;
+  if (currentMode !== "mock" || (statusData.arduino && statusData.arduino.connected && !statusData.arduino.simulated)) {
+    throw new Error("review-loopback is restricted to isolated mock backends; detected non-mock mode or physical hardware");
   }
 } catch (err) {
-  if (err.message && err.message.includes("review-loopback is restricted")) {
+  if (err.message && err.message.includes("review-loopback")) {
     throw err;
   }
-  // Server might not be started yet or uses non-standard route; page.goto will report connection failure
+  throw new Error(`review-loopback security guard: backend not reachable or unsafe: ${err.message}`);
 }
 
 // Optional Playwright loader
@@ -54,12 +71,20 @@ try {
   try {
     playwright = await import("playwright");
   } catch {
-    console.error(
-      "Playwright is not installed. To run this optional verification, install it with:\n" +
-      "  npm install --no-save playwright\n" +
-      "or ensure Playwright is available in your node environment."
-    );
-    process.exit(1);
+    try {
+      const { createRequire } = await import("node:module");
+      const appData = process.env.APPDATA || "";
+      const globalPath = path.join(appData, "npm", "node_modules", "@playwright", "cli", "node_modules", "playwright");
+      const require = createRequire(import.meta.url);
+      playwright = require(globalPath);
+    } catch {
+      console.error(
+        "Playwright is not installed. To run this optional verification, install it with:\n" +
+        "  npm install --no-save playwright\n" +
+        "or ensure Playwright is available in your node environment."
+      );
+      process.exit(1);
+    }
   }
 }
 
@@ -93,13 +118,22 @@ function sanitizeUrl(rawUrl) {
   }
 }
 
+const inviteRequests = [];
 const streamRequests = [];
 const inspectResponses = [];
 const scanRequests = [];
+const stopRequests = [];
 const streamResponses = [];
 const scanResponses = [];
+const stopResponses = [];
 
-const launchOptions = { headless: true };
+const launchOptions = {
+  headless: true,
+  args: [
+    "--use-fake-ui-for-media-stream",
+    "--disable-features=WebRtcHideLocalIpsWithMdns",
+  ],
+};
 if (executablePath) {
   launchOptions.executablePath = executablePath;
 }
@@ -111,7 +145,25 @@ try {
   context = await browser.newContext();
   const page = await context.newPage();
 
+  await page.addInitScript(() => {
+    window.__operatorGetUserMediaCalls = 0;
+    if (navigator.mediaDevices) {
+      const orig = navigator.mediaDevices.getUserMedia?.bind(navigator.mediaDevices);
+      navigator.mediaDevices.getUserMedia = async (...args) => {
+        window.__operatorGetUserMediaCalls = (window.__operatorGetUserMediaCalls || 0) + 1;
+        if (orig) return orig(...args);
+        throw new Error("operator getUserMedia unexpectedly called");
+      };
+    }
+  });
+
   page.on("request", (request) => {
+    if (request.url().includes("/v1/camera/invite")) {
+      inviteRequests.push({ method: request.method(), timestamp: Date.now() });
+    }
+    if (request.url().includes("/v1/stream/stop")) {
+      stopRequests.push({ method: request.method(), timestamp: Date.now(), headers: sanitizeHeaders(request.headers()) });
+    }
     if (request.url().includes("/v1/stream/frame")) {
       streamRequests.push({ method: request.method(), headers: sanitizeHeaders(request.headers()) });
     }
@@ -121,14 +173,17 @@ try {
   });
 
   page.on("response", async (response) => {
+    if (response.url().includes("/v1/stream/stop")) {
+      stopResponses.push({ status: response.status(), timestamp: Date.now(), body: await response.text().catch(() => "") });
+    }
     if (response.url().includes("/v1/stream/frame")) {
-      streamResponses.push({ status: response.status(), body: await response.text().catch(() => "") });
+      streamResponses.push({ status: response.status(), timestamp: Date.now(), body: await response.text().catch(() => "") });
     }
     if (response.url().includes("/v1/analyze/scan")) {
-      scanResponses.push({ status: response.status(), body: await response.text().catch(() => "") });
+      scanResponses.push({ status: response.status(), timestamp: Date.now(), body: await response.text().catch(() => "") });
     }
     if (response.url().includes("/v1/inspect")) {
-      inspectResponses.push({ status: response.status(), body: await response.text().catch(() => "") });
+      inspectResponses.push({ status: response.status(), timestamp: Date.now(), body: await response.text().catch(() => "") });
     }
   });
 
@@ -212,6 +267,12 @@ try {
     await page.waitForTimeout(250);
   }
 
+  // NOTE: Product fix allows clicking 'Analizar toma' DIRECTLY while continuous mode is active.
+  // The frontend awaits /v1/stream/stop before dispatching /v1/analyze/scan.
+  if (!(await continuous.isChecked())) {
+    throw new Error("Expected continuous mode to be active prior to clicking Analizar toma");
+  }
+
   const scanButton = page.getByRole("button", { name: "Analizar toma" });
   if (!(await scanButton.count())) {
     throw new Error("Remote capture scan button was not rendered");
@@ -226,6 +287,11 @@ try {
 
   const hasStream200 = streamResponses.some((r) => r.status === 200);
   const hasScan200 = scanResponses.some((r) => r.status === 200);
+  const hasStop200 = stopResponses.some((r) => r.status === 200);
+
+  const stopOk = stopResponses.find((r) => r.status === 200);
+  const scanOk = scanResponses.find((r) => r.status === 200);
+  const stopBeforeScan = Boolean(stopOk && scanOk && stopOk.timestamp <= scanOk.timestamp);
 
   console.log(JSON.stringify({
     status: "success",
@@ -237,15 +303,157 @@ try {
     streamRequestsCount: streamRequests.length,
     streamResponsesCount: streamResponses.length,
     hasStream200,
+    stopRequestsCount: stopRequests.length,
+    stopResponsesCount: stopResponses.length,
+    hasStop200,
+    stopBeforeScan,
     scanRequestsCount: scanRequests.length,
     scanResponsesCount: scanResponses.length,
+    scanResponses,
     hasScan200,
     resultSignals: resultSignals.filter((signal) => bodyText.includes(signal)),
     screenshotPath,
   }, null, 2));
 
+  if (!hasStop200) {
+    throw new Error("Continuous stream was not automatically stopped via /stream/stop before scan");
+  }
+
   if (!hasScan200) {
     throw new Error("Scan did not receive 200 response from backend");
+  }
+
+  if (!stopBeforeScan) {
+    throw new Error(`/stream/stop (${stopOk?.timestamp}) did not complete BEFORE /analyze/scan (${scanOk?.timestamp})`);
+  }
+
+  // Assert controller lease / session preserved
+  if (bodyText.includes("El control físico fue tomado por otro operador o expiró") || bodyText.includes("controller lease expired")) {
+    throw new Error("Controller lease was lost during scan!");
+  }
+  await page.getByText("Conectado").waitFor({ timeout: 5000 });
+
+  let parsedScan;
+  try {
+    parsedScan = JSON.parse(scanOk.body);
+  } catch {}
+  if (!parsedScan || !Array.isArray(parsedScan.detections) || !parsedScan.image?.width) {
+    throw new Error("Scan response did not contain valid detections or image metadata");
+  }
+
+  // -------------------------------------------------------------------------
+  // Remote Resume Verification:
+  // Product preserves remote MediaStream / RTCPeerConnection upon manual scan freeze.
+  // Clicking "Abrir cámara" must reattach the existing peer stream without:
+  // 1) creating a new QR invite or token
+  // 2) calling getUserMedia on the operator/tablet
+  // 3) renegotiating or dropping the existing WebRTC peer connection
+  // -------------------------------------------------------------------------
+  const inviteCountBeforeResume = inviteRequests.length;
+  const opGetUserMediaBeforeResume = await page.evaluate(() => window.__operatorGetUserMediaCalls || 0);
+  const remoteMediaCallsBeforeResume = await remote.evaluate(() => globalThis.__fakeMediaCalls || 0);
+  const stream200BeforeResume = streamResponses.filter((r) => r.status === 200).length;
+
+  const openCameraBtn = page.getByRole("button", { name: "Abrir cámara" });
+  await openCameraBtn.waitFor({ state: "visible", timeout: 5000 });
+  await openCameraBtn.click();
+
+  // Confirm remote video is live again on operator page
+  await page.waitForFunction(() => {
+    const v = document.querySelector(".viewer-video") || document.querySelector("video");
+    return v && v.srcObject && !v.paused && v.readyState >= 2;
+  }, { timeout: 8000 });
+
+  const resumeVideoState = await page.evaluate(() => {
+    const v = document.querySelector(".viewer-video") || document.querySelector("video");
+    const stream = v?.srcObject;
+    const tracks = stream?.getVideoTracks?.() || [];
+    return {
+      hasSrcObject: Boolean(stream),
+      trackCount: tracks.length,
+      trackReadyState: tracks[0]?.readyState,
+      videoWidth: v?.videoWidth || 0,
+      videoHeight: v?.videoHeight || 0,
+    };
+  });
+
+  if (!resumeVideoState.hasSrcObject || resumeVideoState.trackReadyState !== "live") {
+    throw new Error(`Remote resume failed to restore live video track: ${JSON.stringify(resumeVideoState)}`);
+  }
+
+  // Verify no extra invite/token was requested
+  const inviteCountAfterResume = inviteRequests.length;
+  if (inviteCountAfterResume > inviteCountBeforeResume) {
+    throw new Error(`Remote resume unexpectedly generated a new invite (before: ${inviteCountBeforeResume}, after: ${inviteCountAfterResume})`);
+  }
+
+  // Verify no operator/tablet getUserMedia was invoked
+  const opGetUserMediaAfterResume = await page.evaluate(() => window.__operatorGetUserMediaCalls || 0);
+  if (opGetUserMediaAfterResume > opGetUserMediaBeforeResume) {
+    throw new Error(`Remote resume invoked operator getUserMedia (calls: ${opGetUserMediaAfterResume})`);
+  }
+
+  // Verify phone transmitter did not need to re-call getUserMedia
+  const remoteMediaCallsAfterResume = await remote.evaluate(() => globalThis.__fakeMediaCalls || 0);
+  if (remoteMediaCallsAfterResume > remoteMediaCallsBeforeResume) {
+    throw new Error(`Remote transmitter re-called getUserMedia upon resume (before: ${remoteMediaCallsBeforeResume}, after: ${remoteMediaCallsAfterResume})`);
+  }
+
+  // Enable continuous and confirm fresh 200 frames
+  await continuous.check();
+  await page.waitForTimeout(1500);
+
+  // Wait until new stream 200 responses arrive
+  for (let attempt = 0; attempt < 25; attempt += 1) {
+    const stream200Now = streamResponses.filter((r) => r.status === 200).length;
+    if (stream200Now > stream200BeforeResume) {
+      break;
+    }
+    await page.waitForTimeout(250);
+  }
+
+  const stream200AfterResume = streamResponses.filter((r) => r.status === 200).length;
+  if (stream200AfterResume <= stream200BeforeResume) {
+    throw new Error(`Continuous mode did not receive fresh 200 frames after remote resume (before: ${stream200BeforeResume}, after: ${stream200AfterResume})`);
+  }
+
+  // Take screenshot of resumed live stream
+  const resumeScreenshotPath = path.join(path.dirname(screenshotPath), "remote-resume-live.png");
+  await page.screenshot({ path: resumeScreenshotPath, fullPage: true });
+
+  // Cleanly stop continuous mode
+  await continuous.uncheck();
+  await page.waitForTimeout(500);
+
+  // Assert source / lease / auth intact
+  await page.getByText("Conectado").waitFor({ timeout: 5000 });
+
+  console.log(JSON.stringify({
+    remoteResume: {
+      inviteCountBeforeResume,
+      inviteCountAfterResume,
+      noExtraInviteOrToken: inviteCountAfterResume === inviteCountBeforeResume,
+      opGetUserMediaCalls: opGetUserMediaAfterResume,
+      remoteMediaCalls: remoteMediaCallsAfterResume,
+      resumeVideoState,
+      stream200BeforeResume,
+      stream200AfterResume,
+      freshFramesReceived: stream200AfterResume > stream200BeforeResume,
+      resumeScreenshotPath,
+      passed: true,
+    }
+  }, null, 2));
+
+  // Release controller session so subsequent test suites can acquire control
+  const settingsDisclosure = page.getByRole("button", { name: /Sesión y backend/i });
+  if (await settingsDisclosure.count()) {
+    const isExpanded = await settingsDisclosure.getAttribute("aria-expanded");
+    if (isExpanded !== "true") await settingsDisclosure.click();
+    const releaseBtn = page.getByRole("button", { name: "Liberar sesión" });
+    if (await releaseBtn.count()) {
+      await releaseBtn.click();
+      await page.waitForTimeout(500);
+    }
   }
 } finally {
   if (context) await context.close().catch(() => {});

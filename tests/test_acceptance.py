@@ -164,6 +164,111 @@ def test_serial_transport_explicit_deadline_fence_forces_stale_write_to_zero(mon
     transport.close()
 
 
+def test_serial_transport_generation_fence_while_waiting_for_serial_lock(monkeypatch):
+    fake = _FakePort(["ACK:7\n", "ACK:0\n"])
+    monkeypatch.setattr("serial.Serial", lambda *args, **kwargs: fake)
+    transport = SerialTransport("COM-generation", retries=0)
+    transport._serial = fake
+    epoch = transport.set_scene_deadline(time.time() + 10)
+
+    class GateLock:
+        def __init__(self):
+            self.real = threading.Lock()
+            self.waiting = threading.Event()
+
+        def acquire(self, *args, **kwargs):
+            self.waiting.set()
+            return self.real.acquire(*args, **kwargs)
+
+        def release(self):
+            self.real.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.release()
+
+    gate = GateLock()
+    transport._lock = gate
+    gate.real.acquire()
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault("sent", transport.send_mask(7, retries=0, expected_generation=epoch)))
+    worker.start()
+    gate.waiting.wait()
+    transport.set_scene_deadline(0)
+    gate.real.release()
+    worker.join()
+
+    assert result["sent"] is False
+    assert fake.writes == []
+    transport.close()
+
+
+def test_serial_transport_generation_fence_blocks_retry_after_scene_clear(monkeypatch):
+    transport = SerialTransport("COM-retry", retries=1)
+
+    class FenceAfterFirstAckPort(_FakePort):
+        def __init__(self):
+            super().__init__(["garbage\n", "ACK:7\n"])
+            self.first_read = True
+
+        def readline(self):
+            line = super().readline()
+            if self.first_read:
+                self.first_read = False
+                transport.set_scene_deadline(0)
+            return line
+
+    fake = FenceAfterFirstAckPort()
+    monkeypatch.setattr("serial.Serial", lambda *args, **kwargs: fake)
+    transport._serial = fake
+    epoch = transport.set_scene_deadline(time.time() + 10)
+
+    assert transport.send_mask(7, retries=1, expected_generation=epoch) is False
+    assert fake.writes == ["MASK:7\n"]
+    transport.close()
+
+
+def test_serial_transport_old_epoch_cannot_clear_new_positive_scene(monkeypatch):
+    fake = _FakePort(["ACK:3\n", "ACK:0\n"])
+    monkeypatch.setattr("serial.Serial", lambda *args, **kwargs: fake)
+    transport = SerialTransport("COM-scene", retries=0)
+    transport._serial = fake
+    old_epoch = transport.set_scene_deadline(time.time() + 10)
+    transport.set_scene_deadline(0)
+    new_epoch = transport.set_scene_deadline(time.time() + 10)
+
+    assert transport.send_mask(7, retries=0, expected_generation=old_epoch) is False
+    assert fake.writes == []
+    assert transport.send_mask(3, retries=0, expected_generation=new_epoch) is True
+    assert fake.writes == ["MASK:3\n"]
+    transport.close()
+
+
+def test_simulated_serial_generation_fence_preserves_new_scene():
+    serial = SimulatedSerial()
+    old_epoch = serial.set_scene_deadline(time.time() + 10)
+    serial.set_scene_deadline(0)
+    new_epoch = serial.set_scene_deadline(time.time() + 10)
+
+    assert serial.send_mask(7, expected_generation=old_epoch) is False
+    assert serial.status()["requested_mask"] == 0
+    assert serial.send_mask(3, expected_generation=new_epoch) is True
+    assert serial.status()["confirmed_mask"] == 3
+
+
+def test_simulated_serial_explicit_zero_deadline_stays_fail_closed_for_direct_send():
+    serial = SimulatedSerial()
+    serial.set_scene_deadline(0)
+
+    assert serial.send_mask(7) is True
+    status = serial.status()
+    assert status["requested_mask"] == 0
+    assert status["confirmed_mask"] == 0
+
+
 def test_serial_transport_disconnect_stops_heartbeat_until_explicit_connect(monkeypatch):
     instances = []
 
@@ -285,7 +390,7 @@ def test_api_rejects_missing_ticket_reader_control_and_invalid_uploads():
     assert response.status_code == 401
     reader = _controller(client, role="reader")
     reader_headers = {"X-Session-Id": reader["session_id"], "X-Session-Ticket": reader["ticket"]}
-    assert client.post("/v1/analyze/photo", headers=reader_headers, files={"file": ("x.jpg", _jpeg(), "image/jpeg")}).status_code == 401
+    assert client.post("/v1/analyze/photo", headers=reader_headers, files={"file": ("x.jpg", _jpeg(), "image/jpeg")}).status_code == 403
     control_headers = {"X-Session-Id": controller["session_id"], "X-Session-Ticket": controller["ticket"]}
     before_reader_release = client.get("/v1/status", headers=control_headers).json()["arduino"]["confirmed_mask"]
     assert client.delete(f"/v1/sessions/{reader['session_id']}", headers=reader_headers).status_code == 200
