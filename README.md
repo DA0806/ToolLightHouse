@@ -175,28 +175,31 @@ Pop-Location
 
 ### 6.2 Comandos de Ejecución del Servidor
 
-#### Modo Producción (GPU Real + CUDA + HTTPS LAN)
-```powershell
-$env:TOOLLIGHTHOUSE_PAIRING_KEY = "operador123"
-$env:TOOLLIGHTHOUSE_ADMIN_KEY = "admin123"
+#### Lanzador de Demostración Seguro (Recomendado)
+El script oficial `scripts/start-demo.ps1` solicita credenciales interactivamente mediante `Read-Host -AsSecureString` (sin eco ni persistencia en disco o historial de comandos), valida la coincidencia de certificados TLS y SAN, previene colisiones de puertos e instancias duplicadas, e inicia el backend de forma segura:
 
+```powershell
+# Modo Real con arranque seguro y serial simulado (recomendado para demo):
+.\scripts\start-demo.ps1
+
+# Modo Mock para ensayo rápido de software:
+.\scripts\start-demo.ps1 -Mock
+```
+
+#### Ejecución Directa mediante CLI con Credenciales Seguras en Memoria
+Si prefiere invocar directamente `python -m toollighthouse serve`, configure las credenciales interactivamente sin exponerlas en texto plano en la consola o el historial:
+
+```powershell
+$secPair = Read-Host -Prompt "Clave de Operador (Tablet)" -AsSecureString
+$env:TOOLLIGHTHOUSE_PAIRING_KEY = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPair))
+
+$secAdmin = Read-Host -Prompt "Clave de Administrador" -AsSecureString
+$env:TOOLLIGHTHOUSE_ADMIN_KEY = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secAdmin))
+
+# Modo Real (GPU + CUDA + HTTPS LAN):
 .\.venv\Scripts\python.exe -m toollighthouse serve `
     --mode real `
     --device cuda `
-    --ssl-certfile certificates/lan-cert.pem `
-    --ssl-keyfile certificates/lan-key.pem `
-    --host 0.0.0.0 `
-    --port 8000
-```
-
-#### Modo Desarrollo y Simulación (Mock + LEDs Simulados)
-```powershell
-$env:TOOLLIGHTHOUSE_PAIRING_KEY = "operador123"
-$env:TOOLLIGHTHOUSE_ADMIN_KEY = "admin123"
-
-.\.venv\Scripts\python.exe -m toollighthouse serve `
-    --mode mock `
-    --simulate-leds `
     --ssl-certfile certificates/lan-cert.pem `
     --ssl-keyfile certificates/lan-key.pem `
     --host 0.0.0.0 `

@@ -137,30 +137,26 @@ Remove-NetFirewallRule -DisplayName "ToolLightHouse LAN (HTTPS)"
 
 ## 7. Ejecución del Servidor con TLS
 
-Una vez emitidos los certificados en `certificates/`, inicie el backend utilizando el comando oficial del CLI:
+Una vez emitidos los certificados en `certificates/`, inicie el backend de forma segura:
 
-### Modo Producción (GPU Real + CUDA + Arduino Serial)
+### Lanzador Seguro de Demostración (Recomendado)
 ```powershell
-$env:TOOLLIGHTHOUSE_PAIRING_KEY = "operador123"
-$env:TOOLLIGHTHOUSE_ADMIN_KEY = "admin123"
+# Solicita credenciales de forma interactiva en memoria e inicia el servidor con TLS:
+.\scripts\start-demo.ps1
+```
 
+### Ejecución Directa mediante CLI con Credenciales Seguras en Memoria
+```powershell
+$secPair = Read-Host -Prompt "Clave de Operador (Tablet)" -AsSecureString
+$env:TOOLLIGHTHOUSE_PAIRING_KEY = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPair))
+
+$secAdmin = Read-Host -Prompt "Clave de Administrador" -AsSecureString
+$env:TOOLLIGHTHOUSE_ADMIN_KEY = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secAdmin))
+
+# Modo Real (GPU + CUDA + Arduino Serial/Simulado):
 python -m toollighthouse serve `
     --mode real `
     --device cuda `
-    --ssl-certfile certificates/lan-cert.pem `
-    --ssl-keyfile certificates/lan-key.pem `
-    --host 0.0.0.0 `
-    --port 8000
-```
-
-### Modo Simulación / Desarrollo (Mock + LEDs Simulados)
-```powershell
-$env:TOOLLIGHTHOUSE_PAIRING_KEY = "operador123"
-$env:TOOLLIGHTHOUSE_ADMIN_KEY = "admin123"
-
-python -m toollighthouse serve `
-    --mode mock `
-    --simulate-leds `
     --ssl-certfile certificates/lan-cert.pem `
     --ssl-keyfile certificates/lan-key.pem `
     --host 0.0.0.0 `
@@ -173,6 +169,8 @@ Si prefiere invocar el cargador ASGI directamente:
 python -m uvicorn toollighthouse.api:create_app --factory `
     --host 0.0.0.0 `
     --port 8000 `
+    --log-level warning `
+    --no-access-log `
     --ssl-certfile certificates/lan-cert.pem `
     --ssl-keyfile certificates/lan-key.pem
 ```

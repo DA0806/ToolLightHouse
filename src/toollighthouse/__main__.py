@@ -124,6 +124,7 @@ def main(argv=None):
         settings.pairing_key = args.pairing_key
     import os
     settings.pairing_key = os.getenv("TOOLLIGHTHOUSE_PAIRING_KEY", os.getenv("TOOL_LIGHTHOUSE_PAIRING_KEY", settings.pairing_key))
+    settings.admin_key = os.getenv("TOOLLIGHTHOUSE_ADMIN_KEY", os.getenv("TOOL_LIGHTHOUSE_ADMIN_KEY", settings.admin_key))
     if args.serial and settings.mode == "mock":
         raise SystemExit("physical serial control is unavailable in mock mode; use --mode real")
     if args.command == "test-leds" and not args.simulate_leds and not args.serial:
@@ -196,7 +197,13 @@ def main(argv=None):
         from .pipeline import Pipeline
         # Safe startup keeps the dashboard available while calibration/model
         # assets are still missing; the admin can activate real mode later.
-        uvicorn_options = {"host": args.host, "port": args.port}
+        uvicorn_options = {
+            "host": args.host,
+            "port": args.port,
+            # Avoid access logs echoing WebSocket query strings (tickets).
+            "log_level": "warning",
+            "access_log": False,
+        }
         if args.ssl_certfile:
             uvicorn_options.update(ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile)
         uvicorn.run(
