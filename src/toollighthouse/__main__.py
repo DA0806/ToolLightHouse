@@ -78,7 +78,17 @@ def main(argv=None):
     parser.add_argument("--confirm-inventory", action="store_true", help="required before driving physical LEDs")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--ssl-certfile")
+    parser.add_argument("--ssl-keyfile")
     args = parser.parse_args(argv)
+    if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
+        parser.error("--ssl-certfile and --ssl-keyfile must be provided together")
+    if (args.ssl_certfile or args.ssl_keyfile) and args.command != "serve":
+        parser.error("TLS certificate options are only valid with the serve command")
+    if args.command == "serve" and args.ssl_certfile:
+        path_type = __import__("pathlib").Path
+        if not path_type(args.ssl_certfile).is_file() or not path_type(args.ssl_keyfile).is_file():
+            parser.error("--ssl-certfile and --ssl-keyfile must point to existing files")
     if args.max_frames < 0:
         parser.error("--max-frames must be non-negative")
     if args.simulate_leds and args.serial:
@@ -186,10 +196,12 @@ def main(argv=None):
         from .pipeline import Pipeline
         # Safe startup keeps the dashboard available while calibration/model
         # assets are still missing; the admin can activate real mode later.
+        uvicorn_options = {"host": args.host, "port": args.port}
+        if args.ssl_certfile:
+            uvicorn_options.update(ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile)
         uvicorn.run(
             create_app(settings, Pipeline(settings, serial=serial, safe_startup=True), config_path=args.config),
-            host=args.host,
-            port=args.port,
+            **uvicorn_options,
         )
         return 0
     if args.command == "test-leds":

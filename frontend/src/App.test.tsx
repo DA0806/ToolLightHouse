@@ -4,7 +4,33 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 
 const api = vi.hoisted(() => ({
-  createSession: vi.fn(), createWsTicket: vi.fn(), getStatus: vi.fn(), getInventory: vi.fn(), openEvents: vi.fn(), releaseSession: vi.fn(), analyzePhoto: vi.fn(), streamFrame: vi.fn(), calibrateBackground: vi.fn(), defaultApiUrl: vi.fn(() => 'http://localhost:8000'), ApiError: class ApiError extends Error { status = 0 },
+  createSession: vi.fn(), createWsTicket: vi.fn(), getStatus: vi.fn(), getInventory: vi.fn(), openEvents: vi.fn(), releaseSession: vi.fn(), analyzePhoto: vi.fn(), streamFrame: vi.fn(), calibrateBackground: vi.fn(), defaultApiUrl: vi.fn(() => 'http://localhost:8000'),
+  getCameraSources: vi.fn().mockResolvedValue({
+    sources: [{
+      source_id: 'operator_device',
+      name: 'Cámara de este Navegador',
+      kind: 'browser',
+      status: 'active',
+      resolution: { width: 1280, height: 720 },
+      fps: 30,
+      requires_operator_action: true,
+      calibration_available: false,
+    }],
+    active_source_id: 'operator_device',
+    source_version: 1,
+  }),
+  setActiveCameraSource: vi.fn().mockResolvedValue({ active_source_id: 'remote_phone', source_version: 1 }),
+  createCameraInvite: vi.fn().mockResolvedValue({ invite_id: 'inv-1', invite_token: 'tok-1', invite_url: 'http://localhost:8000/camera#token=tok-1', expires_at: 9999999999 }),
+  cancelCameraInvite: vi.fn().mockResolvedValue({ cancelled: true }),
+  revokeCameraTransmitters: vi.fn().mockResolvedValue({ revoked: true, disconnected_transmitters: 0 }),
+  scanTools: vi.fn(),
+  takeoverLease: vi.fn().mockResolvedValue({ success: true, lease_generation: 2, holder: 'admin-sess' }),
+  sessionHeartbeat: vi.fn().mockResolvedValue({ success: true, lease_held: true, lease_generation: 1, expires_in: 30 }),
+  getCalibrationProfiles: vi.fn().mockResolvedValue({ profiles: {} }),
+  captureProfileBackground: vi.fn(),
+  updateProfileRoi: vi.fn(),
+  confirmLegacyProfile: vi.fn(),
+  ApiError: class ApiError extends Error { status = 0 },
 }))
 vi.mock('./api', () => api)
 
@@ -31,6 +57,7 @@ describe('dashboard connection and camera lifecycle', () => {
     await waitFor(() => expect(screen.getByText('Control exclusivo de este teléfono')).toBeInTheDocument())
     expect(api.createSession).toHaveBeenCalledWith(expect.any(String), expect.any(String), 'phone-test', 'controller')
     expect(api.createWsTicket).toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Abrir cámara' })).not.toBeDisabled())
     fireEvent.click(screen.getByRole('button', { name: 'Abrir cámara' }))
     await waitFor(() => expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalled())
     expect(screen.getByLabelText('Vista previa de la cámara')).toBeInTheDocument()
@@ -71,6 +98,7 @@ describe('dashboard connection and camera lifecycle', () => {
     render(<StrictMode><App /></StrictMode>)
     fireEvent.click(screen.getByRole('button', { name: 'Verificar y conectar' }))
     await waitFor(() => expect(screen.getByText('Control exclusivo de este teléfono')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Abrir cámara' })).not.toBeDisabled())
     fireEvent.click(screen.getByRole('button', { name: 'Abrir cámara' }))
     await waitFor(() => expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalled())
     fireEvent.click(screen.getByRole('button', { name: 'Liberar sesión' }))
@@ -88,6 +116,7 @@ describe('dashboard connection and camera lifecycle', () => {
     render(<StrictMode><App /></StrictMode>)
     fireEvent.click(screen.getByRole('button', { name: 'Verificar y conectar' }))
     await waitFor(() => expect(screen.getByText('Control exclusivo de este teléfono')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Abrir cámara' })).not.toBeDisabled())
     fireEvent.click(screen.getByRole('button', { name: 'Abrir cámara' }))
     await waitFor(() => expect((screen.getByLabelText('Vista previa de la cámara') as HTMLVideoElement).srcObject).toBe(first))
     fireEvent.click(screen.getByRole('button', { name: 'Cerrar cámara' }))

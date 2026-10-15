@@ -4,22 +4,36 @@ import {
   ApiError,
   applyConfig,
   calibrateBackground,
+  cancelCameraInvite,
+  createCameraInvite,
   createSession,
   createWsTicket,
   defaultApiUrl,
+  getCameraSources,
   getConfig,
   getConfigStatus,
   getInventory,
   getStatus,
+  getWebcams,
   openEvents,
   releaseSession,
+  revokeCameraTransmitters,
+  scanTools,
+  setActiveCameraSource,
+  sessionHeartbeat,
   streamFrame,
+  takeoverLease,
   updateConfig,
+  updateCameraSourceSettings,
   type Credentials,
+  type WebCamDevice,
 } from './api'
 import type {
   ActiveTab,
+  ActivityLogItem,
   AnalysisResponse,
+  CameraInviteResponse,
+  CameraSourceDescriptor,
   ConfigResponse,
   ConfigStatusResponse,
   ConnectionState,
@@ -34,11 +48,23 @@ import { ToolManager } from './components/ToolManager'
 import { CalibrationView } from './components/CalibrationView'
 import { ArduinoPanel } from './components/ArduinoPanel'
 import { SystemPanel } from './components/SystemPanel'
+import { CameraSelector } from './components/CameraSelector'
+import { QRModal } from './components/QRModal'
+import { RemoteCameraView } from './components/RemoteCameraView'
 import './styles.css'
 
 const DEVICE_KEY = 'toollighthouse.device-id'
 const URL_KEY = 'toollighthouse.api-url'
 const MAX_RECONNECT_ATTEMPTS = 5
+
+function appWebsocketUrl(baseUrl: string, path: string): string {
+  const parsed = new URL(baseUrl.replace(/\/+$/, ''))
+  parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:'
+  parsed.pathname = path
+  parsed.search = ''
+  parsed.hash = ''
+  return parsed.toString()
+}
 
 function useStoredValue(key: string, fallback: string) {
   const [value, setValue] = useState(() => localStorage.getItem(key) || fallback)
@@ -109,6 +135,10 @@ function loadImageSize(url: string): Promise<{ width: number; height: number } |
 }
 
 export default function App() {
+  if (typeof window !== 'undefined' && (window.location.pathname === '/camera' || window.location.pathname === '/camera/')) {
+    return <RemoteCameraView />
+  }
+
   const [apiUrl, setApiUrl] = useStoredValue(URL_KEY, defaultApiUrl())
   const [deviceId, setDeviceId] = useStoredValue(DEVICE_KEY, `phone-${Math.random().toString(36).slice(2, 8)}`)
   const [pairingKey, setPairingKey] = useState('')
@@ -134,6 +164,29 @@ export default function App() {
   const [inventoryExample, setInventoryExample] = useState(false)
   const [calibrating, setCalibrating] = useState(false)
   const [viewerSize, setViewerSize] = useState({ width: 0, height: 0 })
+  const [cameraSources, setCameraSources] = useState<CameraSourceDescriptor[]>([])
+  const [webcams, setWebcams] = useState<WebCamDevice[]>([])
+  const [activeSourceId, setActiveSourceId] = useState<string>('remote_phone')
+  const [sourceVersion, setSourceVersion] = useState<number | null>(null)
+  const [observedVideo, setObservedVideo] = useState<{ width: number; height: number; fps: number | null } | null>(null)
+  const [qrModalOpen, setQrModalOpen] = useState<boolean>(false)
+  const [activeInvite, setActiveInvite] = useState<CameraInviteResponse | null>(null)
+  const [activityLogs, setActivityLogs] = useState<ActivityLogItem[]>([
+    {
+      id: 'init',
+      time: new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      message: 'Sistema listo. Esperando conexión o captura.',
+      type: 'info',
+    },
+  ])
+  const [backendPreviewUrl, setBackendPreviewUrl] = useState<string | null>(null)
+  const [backendPreviewBlob, setBackendPreviewBlob] = useState<Blob | null>(null)
+  const backendPreviewBlobRef = useRef<Blob | null>(null)
+  const [transmitterConnected, setTransmitterConnected] = useState<boolean>(false)
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
+  const signalingWsRef = useRef<WebSocket | null>(null)
+  const previewWsRef = useRef<WebSocket | null>(null)
+  const remoteStreamRef = useRef<MediaStream | null>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const cameraStream = useRef<MediaStream | null>(null)
   const cameraRequestGeneration = useRef(0)
@@ -154,10 +207,50 @@ export default function App() {
   const configRef = useRef<ConfigResponse | null>(null)
   const draftConfigRef = useRef<ConfigResponse | null>(null)
 
+  const logActivity = useCallback((message: string, type: ActivityLogItem['type'] = 'info', dedupeKey?: string) => {
+    setActivityLogs((prev) => {
+      if (dedupeKey && prev.some((item) => item.dedupeKey === dedupeKey)) return prev
+      if (!dedupeKey && prev.length > 0 && prev[0].message === message) return prev
+      const item: ActivityLogItem = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        time: new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        message,
+        type,
+        dedupeKey,
+      }
+      return [item, ...prev].slice(0, 20)
+    })
+  }, [])
+
   configRef.current = config
   draftConfigRef.current = draftConfig
 
   const canControl = session?.role === 'controller' || session?.role === 'admin'
+
+  const observeVideoStream = useCallback((stream: MediaStream) => {
+    const video = videoRef.current
+    if (!video) return
+    const update = () => {
+      if (cameraStream.current !== stream && remoteStreamRef.current !== stream) return
+      const track = stream.getVideoTracks?.()[0]
+      const settings = track?.getSettings?.() as MediaTrackSettings | undefined
+      const width = video.videoWidth || Number(settings?.width) || 0
+      const height = video.videoHeight || Number(settings?.height) || 0
+      if (width > 0 && height > 0) {
+        const fps = Number(settings?.frameRate)
+        setObservedVideo({ width, height, fps: Number.isFinite(fps) && fps > 0 ? fps : null })
+      }
+    }
+    video.addEventListener('loadedmetadata', update, { once: true })
+    let attempts = 0
+    const poll = () => {
+      update()
+      attempts += 1
+      if (attempts < 20) window.setTimeout(poll, 100)
+    }
+    poll()
+    void video.play().then(update).catch(() => undefined)
+  }, [])
 
   const hasLocalDraftChanges = useMemo(() => {
     if (!config || !draftConfig) return false
@@ -259,7 +352,16 @@ export default function App() {
       return
     }
     setAnalysis(result)
-  }, [preview, setPreviewSafely])
+    const detectedNames = (result.detections || []).map((d: any) => d.name || d.class_id).filter(Boolean)
+    if (detectedNames.length > 0) {
+      logActivity(`Detección: ${detectedNames.join(', ')}`, 'success', `detection:${result.frame_id}`)
+    } else {
+      logActivity('Inspección: Sin herramientas detectadas', 'info', `detection:${result.frame_id}`)
+    }
+    if (result.arduino?.ack) {
+      logActivity(`ACK Hardware: MASK 0x${(result.arduino.confirmed_mask || 0).toString(16).toUpperCase()}`, 'info', `ack:${result.frame_id}`)
+    }
+  }, [logActivity, preview, setPreviewSafely])
 
   const handleEvent = useCallback((event: WsEvent, isCurrent: () => boolean = () => true) => {
     const result = eventResult(event)
@@ -461,6 +563,320 @@ export default function App() {
     }
   }
 
+  const refreshSources = useCallback(async () => {
+    if (!session || typeof getCameraSources !== 'function') return
+    try {
+      const res = await getCameraSources(apiUrl, session)
+      if (mounted.current && res?.sources) {
+        setCameraSources(res.sources)
+        if (res.active_source_id) setActiveSourceId(res.active_source_id)
+        if (Number.isFinite(res.source_version)) setSourceVersion(res.source_version)
+      }
+      if (typeof getWebcams === 'function') {
+        const webcamResponse = await getWebcams(apiUrl, session)
+        if (mounted.current) setWebcams(webcamResponse.devices || [])
+      }
+    } catch {
+      // Ignored in mock/offline
+    }
+  }, [apiUrl, session])
+
+  const handleSelectWebcam = async (sourceId: string, device: WebCamDevice) => {
+    if (!session || typeof updateCameraSourceSettings !== 'function') return
+    try {
+      await updateCameraSourceSettings(apiUrl, session, sourceId, {
+        device_index: device.index,
+        width: device.width,
+        height: device.height,
+        fps: device.fps,
+      })
+      logActivity(`Perfil de captura actualizado: ${device.name}`, 'info')
+      await refreshSources()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'No se pudo actualizar la cámara web')
+    }
+  }
+
+  const handleSelectSource = async (sourceId: string) => {
+    if (!session || typeof setActiveCameraSource !== 'function') return
+    try {
+      cameraRequestGeneration.current += 1
+      streamGeneration.current += 1
+      cameraStream.current?.getTracks().forEach((track) => track.stop())
+      cameraStream.current = null
+      remoteStreamRef.current = null
+      if (videoRef.current) videoRef.current.srcObject = null
+      setCameraOn(false)
+      setContinuous(false)
+      setObservedVideo(null)
+      setAnalysis(null)
+      setPreview(null)
+      sceneGeneration.current += 1
+      await setActiveCameraSource(apiUrl, session, sourceId)
+      setActiveSourceId(sourceId)
+      logActivity(`Cambio de fuente a: ${sourceId}`, 'info')
+      await refreshSources()
+    } catch (err: any) {
+      setError(err instanceof Error ? err.message : 'Error al cambiar fuente de cámara')
+    }
+  }
+
+  const handleOpenInvite = async () => {
+    if (!session || typeof createCameraInvite !== 'function') {
+      setError('Conecta una sesión de controlador para generar invitaciones.')
+      return
+    }
+    try {
+      const invite = await createCameraInvite(apiUrl, session)
+      setActiveInvite(invite)
+      setQrModalOpen(true)
+      logActivity('Invitación QR generada para cámara celular', 'info')
+    } catch (err: any) {
+      setError(err instanceof Error ? err.message : 'Error al generar código QR')
+    }
+  }
+
+  const handleCancelInvite = async () => {
+    if (!session || !activeInvite || typeof cancelCameraInvite !== 'function') return
+    try {
+      await cancelCameraInvite(apiUrl, session, activeInvite.invite_id)
+      setActiveInvite(null)
+      logActivity('Invitación QR cancelada', 'warning')
+    } catch {
+      // Ignore
+    }
+  }
+
+  const handleRevokeTransmitters = async () => {
+    if (!session || typeof revokeCameraTransmitters !== 'function') return
+    try {
+      const res = await revokeCameraTransmitters(apiUrl, session)
+      logActivity(`Transmisores revocados: ${res.disconnected_transmitters}`, 'warning')
+      setLeaseMessage('Transmisores desconectados y revocados.')
+    } catch (err: any) {
+      setError(err instanceof Error ? err.message : 'Error al revocar transmisores')
+    }
+  }
+
+  const handleTakeover = async () => {
+    if (!session || session.role !== 'admin' || typeof takeoverLease !== 'function') return
+    try {
+      const res = await takeoverLease(apiUrl, session)
+      if (res.success) {
+        logActivity('Control físico expropiado por administrador', 'warning')
+        setLeaseMessage('Has tomado control físico exclusivo del sistema.')
+      }
+    } catch (err: any) {
+      setError(err instanceof Error ? err.message : 'Error al tomar control')
+    }
+  }
+
+  useEffect(() => {
+    if (session) void refreshSources()
+  }, [refreshSources, session])
+
+  useEffect(() => {
+    if (!session || (session.role !== 'controller' && session.role !== 'admin') || typeof sessionHeartbeat !== 'function') return
+    const current = session
+    const timer = setInterval(() => {
+      void sessionHeartbeat(apiUrl, current).catch(() => {})
+    }, 4500)
+    return () => clearInterval(timer)
+  }, [apiUrl, session])
+
+  // WebRTC Operator Signaling for remote_phone
+  useEffect(() => {
+    if (!session || !canControl || activeSourceId !== 'remote_phone') {
+      if (signalingWsRef.current) {
+        signalingWsRef.current.close()
+        signalingWsRef.current = null
+      }
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close()
+        peerConnectionRef.current = null
+      }
+      remoteStreamRef.current = null
+      if (videoRef.current && !cameraStream.current) videoRef.current.srcObject = null
+      setTransmitterConnected(false)
+      if (!cameraStream.current) {
+        setObservedVideo(null)
+        setCameraOn(false)
+      }
+      return
+    }
+
+    let active = true
+    const wsUrl = appWebsocketUrl(apiUrl, '/v1/camera/signal')
+    let ws: WebSocket | null = null
+    let pendingCandidates: RTCIceCandidateInit[] = []
+
+    try {
+      ws = new WebSocket(wsUrl)
+      signalingWsRef.current = ws
+
+      ws.onopen = () => {
+        if (!active || !ws) return
+        ws.send(
+          JSON.stringify({
+            type: 'auth_operator',
+            session_id: session.sessionId,
+            ticket: session.ticket,
+          })
+        )
+      }
+
+      ws.onmessage = async (evt) => {
+        if (!active) return
+        try {
+          const msg = JSON.parse(evt.data)
+          if (msg.type === 'auth_ok') {
+            logActivity('Operador autenticado en señalización P2P', 'info')
+          } else if (msg.type === 'peer_connected') {
+            setTransmitterConnected(true)
+            logActivity('Cámara remota conectada. Estableciendo WebRTC P2P...', 'info')
+
+            peerConnectionRef.current?.close()
+            const pc = new RTCPeerConnection({ iceServers: [] })
+            peerConnectionRef.current = pc
+            pendingCandidates = []
+            pc.addTransceiver('video', { direction: 'recvonly' })
+
+            pc.ontrack = (event) => {
+              if (!active) return
+              if (event.streams[0]) {
+                remoteStreamRef.current = event.streams[0]
+                if (videoRef.current) {
+                  videoRef.current.srcObject = event.streams[0]
+                  void videoRef.current.play().catch(() => {})
+                }
+                observeVideoStream(event.streams[0])
+                setCameraOn(true)
+                logActivity('Video WebRTC P2P en vivo recibido', 'info')
+              }
+            }
+
+            pc.onicecandidate = (event) => {
+              if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }))
+              }
+            }
+
+            const offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'offer', sdp: offer }))
+            }
+          } else if (msg.type === 'answer') {
+            if (peerConnectionRef.current) {
+              await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(msg.sdp))
+              for (const candidate of pendingCandidates.splice(0)) {
+                await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {})
+              }
+            }
+          } else if (msg.type === 'candidate') {
+            if (peerConnectionRef.current && msg.candidate) {
+              if (peerConnectionRef.current.remoteDescription) {
+                await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(() => {})
+              } else {
+                pendingCandidates.push(msg.candidate as RTCIceCandidateInit)
+              }
+            }
+          } else if (msg.type === 'peer_disconnected') {
+            setTransmitterConnected(false)
+            remoteStreamRef.current = null
+            if (videoRef.current) videoRef.current.srcObject = null
+            setCameraOn(false)
+            setObservedVideo(null)
+            logActivity('Cámara remota desconectada', 'warning')
+          }
+        } catch {
+          // Ignore parse errors
+        }
+      }
+
+      ws.onclose = () => {
+        if (active) setTransmitterConnected(false)
+      }
+    } catch {
+      // WS constructor error
+    }
+
+    return () => {
+      active = false
+      if (ws) ws.close()
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close()
+        peerConnectionRef.current = null
+      }
+      remoteStreamRef.current = null
+      pendingCandidates = []
+      if (videoRef.current && !cameraStream.current) videoRef.current.srcObject = null
+      setTransmitterConnected(false)
+      setCameraOn(false)
+    }
+  }, [activeSourceId, apiUrl, canControl, logActivity, observeVideoStream, session])
+
+  // Backend Binary Preview WebSocket for OpenCV and remote fallback sources.
+  useEffect(() => {
+    const wantsBackendPreview = activeSourceId === 'remote_phone' || activeSourceId === 'laptop_builtin' || activeSourceId === 'usb_webcam'
+    if (!session || !wantsBackendPreview) {
+      if (previewWsRef.current) {
+        previewWsRef.current.close()
+        previewWsRef.current = null
+      }
+      if (backendPreviewUrl) {
+        URL.revokeObjectURL(backendPreviewUrl)
+        setBackendPreviewUrl(null)
+      }
+      setBackendPreviewBlob(null)
+      backendPreviewBlobRef.current = null
+      return
+    }
+
+    let active = true
+    const wsUrl = appWebsocketUrl(apiUrl, '/v1/camera/preview-ws')
+    let ws: WebSocket | null = null
+
+    try {
+      ws = new WebSocket(wsUrl)
+      ws.binaryType = 'arraybuffer'
+      previewWsRef.current = ws
+
+      ws.onopen = () => {
+        if (active && ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'auth', session_id: session.sessionId, ticket: session.ticket }))
+        }
+      }
+
+      ws.onmessage = (evt) => {
+        if (!active) return
+        if (evt.data instanceof ArrayBuffer || evt.data instanceof Blob) {
+          const blob = new Blob([evt.data], { type: 'image/jpeg' })
+          const url = URL.createObjectURL(blob)
+          setBackendPreviewUrl((prev) => {
+            if (prev) URL.revokeObjectURL(prev)
+            return url
+          })
+           setBackendPreviewBlob(blob)
+           backendPreviewBlobRef.current = blob
+        }
+      }
+    } catch {
+      // Ignore
+    }
+
+    return () => {
+      active = false
+      if (ws) ws.close()
+      setBackendPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev)
+        return null
+      })
+       setBackendPreviewBlob(null)
+       backendPreviewBlobRef.current = null
+    }
+  }, [activeSourceId, apiUrl, session])
+
   const handleApplyConfig = async () => {
     if (!session || session.role !== 'admin') return
     setApplyingConfig(true)
@@ -507,6 +923,7 @@ export default function App() {
     cameraStream.current?.getTracks().forEach((track) => track.stop())
     cameraStream.current = null
     if (videoRef.current) videoRef.current.srcObject = null
+    setObservedVideo(null)
     setCameraOn(false); setContinuous(false)
   }, [])
 
@@ -570,14 +987,32 @@ export default function App() {
   const inspect = async (blob = preview?.blob) => {
     if (!session) { setError('Conecta una sesión de controlador antes de analizar.'); return }
     if (status?.maintenance_mode) { setError('El análisis está deshabilitado durante el modo de mantenimiento de Arduino.'); return }
-    if (!blob) { setError('Selecciona una imagen o inicia la cámara.'); return }
     const requestSession = session
     const requestSessionGeneration = sessionGeneration.current
     const requestSceneGeneration = sceneGeneration.current
     setBusy(true); setError('')
     try {
-      const result = await analyzePhoto(apiUrl, requestSession, blob)
-      if (mounted.current && sessionRef.current === requestSession && sessionGeneration.current === requestSessionGeneration && sceneGeneration.current === requestSceneGeneration) void acceptResult(result, blob, () => mounted.current && sessionRef.current === requestSession && sessionGeneration.current === requestSessionGeneration && sceneGeneration.current === requestSceneGeneration)
+      if (activeSourceId === 'laptop_builtin' || activeSourceId === 'usb_webcam' || activeSourceId === 'remote_phone') {
+        const backendCaptureSource = activeSourceId === 'laptop_builtin' || activeSourceId === 'usb_webcam'
+        const fallbackBlob = blob || backendPreviewBlob
+        const response: any = await scanTools(apiUrl, requestSession, backendCaptureSource ? undefined : blob)
+        const analysisData = response.result || response
+        if (response.preview_url && mounted.current) {
+            setPreviewSafely({
+            blob: fallbackBlob || new Blob([]),
+            url: response.preview_url,
+            width: analysisData.image?.width || 640,
+            height: analysisData.image?.height || 480,
+          })
+        }
+        if (mounted.current && sessionRef.current === requestSession && sessionGeneration.current === requestSessionGeneration && sceneGeneration.current === requestSceneGeneration) {
+          void acceptResult(analysisData, fallbackBlob || new Blob([]), () => mounted.current && sessionRef.current === requestSession && sessionGeneration.current === requestSessionGeneration && sceneGeneration.current === requestSceneGeneration)
+        }
+      } else {
+        if (!blob) { setError('Selecciona una imagen o inicia la cámara.'); return }
+        const result = await analyzePhoto(apiUrl, requestSession, blob)
+        if (mounted.current && sessionRef.current === requestSession && sessionGeneration.current === requestSessionGeneration && sceneGeneration.current === requestSceneGeneration) void acceptResult(result, blob, () => mounted.current && sessionRef.current === requestSession && sessionGeneration.current === requestSessionGeneration && sceneGeneration.current === requestSceneGeneration)
+      }
     }
     catch (caught) {
       if (caught instanceof ApiError && (caught.status === 401 || caught.status === 409)) {
@@ -590,6 +1025,15 @@ export default function App() {
   const startCamera = async () => {
     if (!canControl) { setError('El modo lector puede consultar resultados, pero no controla la cámara ni el Arduino.'); return }
     if (status?.maintenance_mode) { setError('La cámara está deshabilitada durante el modo de mantenimiento de Arduino.'); return }
+    const selectedSource = cameraSources.find((source) => source.source_id === activeSourceId)
+    if (!selectedSource) {
+      setError('Aún no hay una fuente de cámara válida disponible.')
+      return
+    }
+    if (selectedSource.kind !== 'browser') {
+      setError('La cámara de esta pantalla solo está disponible al seleccionar la fuente operator_device.')
+      return
+    }
     const requestGeneration = ++cameraRequestGeneration.current
     cameraStream.current?.getTracks().forEach((track) => track.stop())
     cameraStream.current = null
@@ -602,14 +1046,17 @@ export default function App() {
         return
       }
       cameraStream.current = stream; setCameraOn(true)
+      observeVideoStream(stream)
     } catch { setError('La cámara requiere HTTPS o localhost y permiso del navegador. También puedes elegir una foto.') }
   }
 
   useEffect(() => {
-    if (!cameraOn || !cameraStream.current || !videoRef.current) return
-    videoRef.current.srcObject = cameraStream.current
-    void videoRef.current.play().catch(() => undefined)
-  }, [cameraOn])
+    const video = videoRef.current
+    const stream = cameraStream.current || remoteStreamRef.current
+    if (!cameraOn || !stream || !video) return
+    video.srcObject = stream
+    observeVideoStream(stream)
+  }, [activeSourceId, cameraOn, observeVideoStream, transmitterConnected])
 
   useEffect(() => {
     const viewer = viewerRef.current
@@ -643,7 +1090,9 @@ export default function App() {
 
   useEffect(() => {
     continuousMode.current = continuous
-    if (!continuous || !cameraOn || !session) return
+    const backendSource = activeSourceId === 'laptop_builtin' || activeSourceId === 'usb_webcam'
+    const remoteFallbackSource = activeSourceId === 'remote_phone' && !cameraOn
+    if (!continuous || !session || (!cameraOn && !backendSource && !remoteFallbackSource)) return
     const runGeneration = ++streamGeneration.current
     let stopped = false
     let active = false
@@ -654,7 +1103,10 @@ export default function App() {
       const submitted = pending; pending = null; latestFrame.current = null
       const requestSession = sessionRef.current
       try {
-        const response = await streamFrame(apiUrl, requestSession, submitted)
+        const response = await streamFrame(apiUrl, requestSession, submitted, 12000, {
+          sourceId: activeSourceId,
+          sourceVersion: sourceVersion ?? undefined,
+        })
         if (!stopped && runGeneration === streamGeneration.current && sessionRef.current === requestSession && response.result) {
           const result = response.result
           void acceptResult(result, submitted, () => mounted.current && !stopped && runGeneration === streamGeneration.current && sessionRef.current === requestSession)
@@ -672,10 +1124,11 @@ export default function App() {
     }
     const interval = window.setInterval(() => {
       if (stopped) return
-      void captureFromVideo().then((blob) => { if (blob && !stopped) { pending = blob; latestFrame.current = blob; void dispatch() } })
-    }, 900)
+      const capture = cameraOn ? captureFromVideo() : Promise.resolve(backendPreviewBlobRef.current)
+      void capture.then((blob) => { if (blob && !stopped) { pending = blob; latestFrame.current = blob; void dispatch() } })
+    }, 500)
     return () => { stopped = true; streamGeneration.current += 1; pending = null; latestFrame.current = null; active = false; window.clearInterval(interval) }
-  }, [acceptResult, apiUrl, cameraOn, continuous, session, stopCamera])
+  }, [acceptResult, activeSourceId, apiUrl, cameraOn, continuous, session, sourceVersion, stopCamera])
 
   const simulation = analysis?.simulated || analysis?.arduino.simulated || Boolean(status?.arduino?.simulated)
   const imageWidth = analysis?.image.width || preview?.width || 1
@@ -686,6 +1139,28 @@ export default function App() {
     : 1
   const overlayFontSize = Math.max(8, Math.min(64, 14 / Math.max(renderedScale, 0.001)))
   const detections = analysis?.detections || []
+  const toolSlots = useMemo(() => {
+    const categories = config?.inventory?.categories || []
+    return Array.from({ length: 9 }, (_, index) => {
+      const cat = categories[index]
+      const classId = cat?.class_id || `tool_${index + 1}`
+      const name = cat?.display_name || cat?.name || (inventoryExample ? `Ubicación ${index + 1}` : `Casillero ${index + 1}`)
+      const location = cat?.location || `Casillero ${index + 1}`
+      const isDetected = detections.some((d) => d.class_id === classId || d.name?.toLowerCase() === cat?.name?.toLowerCase())
+      return {
+        index,
+        classId,
+        name,
+        location,
+        isDetected,
+        isStored: isDetected,
+      }
+    })
+  }, [config, detections, inventoryExample])
+
+  const detectedCount = toolSlots.filter((t) => t.isStored).length
+  const notDetectedCount = toolSlots.length - detectedCount
+
   const ledItems = useMemo(() => Array.from({ length: 9 }, (_, bit) => {
     const item = inventory.find((candidate, index) => (candidate.led_index ?? candidate.bit ?? index) === bit)
     const ackKnown = Boolean(analysis?.arduino.connected && analysis?.arduino.ack)
@@ -724,6 +1199,17 @@ export default function App() {
               <strong>Modo de mantenimiento activo:</strong> La cámara, captura y análisis están bloqueados hasta que finalice el mantenimiento de Arduino.
             </div>
           )}
+          <CameraSelector
+            sources={cameraSources}
+            webcams={webcams}
+            activeSourceId={activeSourceId}
+            onSelectSource={handleSelectSource}
+            onSelectWebcam={handleSelectWebcam}
+            onOpenInviteModal={handleOpenInvite}
+            onRevokeTransmitters={handleRevokeTransmitters}
+            observedVideo={observedVideo}
+            disabled={!canControl || Boolean(status?.maintenance_mode)}
+          />
           <div className="section-heading"><div><p className="eyebrow">Escena</p><h2>Inspección fotográfica</h2></div><span className="mode-chip">{simulation ? 'Simulación activa' : analysis?.mode || 'Listo'}</span></div>
           <div ref={viewerRef} className={`viewer ${preview ? 'viewer-ready' : ''}`}>
             {preview ? <svg className="preview-svg" viewBox={`0 0 ${imageWidth} ${imageHeight}`} preserveAspectRatio={preserve} role="img" aria-label="Fotografía con detecciones">
@@ -734,26 +1220,95 @@ export default function App() {
               </g>)}
             </svg> : <div className="empty-viewer"><span className="crosshair" aria-hidden="true">＋</span><strong>La bandeja aparecerá aquí</strong><span>Elige una foto o abre la cámara para comenzar.</span></div>}
             <video className={`camera-preview ${cameraOn ? '' : 'camera-hidden'}`} ref={videoRef} muted playsInline aria-label="Vista previa de la cámara" />
+            {backendPreviewUrl && (activeSourceId === 'laptop_builtin' || activeSourceId === 'usb_webcam' || (activeSourceId === 'remote_phone' && !cameraOn)) && (
+              <img
+                src={backendPreviewUrl}
+                alt="Vista previa de cámara web"
+                className="camera-preview"
+                style={{ objectFit: fit }}
+              />
+            )}
             {busy && <div className="viewer-busy" role="status">Analizando en la laptop…</div>}
           </div>
           <div className="capture-row">
             <label className="button button-primary"><span aria-hidden="true">↥</span> Elegir foto<input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; void chooseImage(file) }} /></label>
-            <button className="button button-secondary" onClick={() => cameraOn ? stopCamera() : void startCamera()} disabled={!canControl || Boolean(status?.maintenance_mode)}>{cameraOn ? 'Cerrar cámara' : 'Abrir cámara'}</button>
-            {cameraOn && <button className="button button-accent" onClick={() => void captureFromVideo().then((blob) => { if (!blob) return; const width = videoRef.current?.videoWidth || 1; const height = videoRef.current?.videoHeight || 1; setPreviewSafely({ blob, url: URL.createObjectURL(blob), width, height }); stopCamera(); void inspect(blob) })} disabled={busy || !canControl || Boolean(status?.maintenance_mode)}>Analizar toma</button>}
-            {!cameraOn && <button className="button button-accent" onClick={() => void inspect()} disabled={busy || !preview || !canControl || Boolean(status?.maintenance_mode)}>{busy ? 'Analizando…' : 'Analizar foto'}</button>}
+            <button className="button button-secondary" onClick={() => cameraOn ? stopCamera() : void startCamera()} disabled={!canControl || Boolean(status?.maintenance_mode) || (!cameraOn && cameraSources.find((source) => source.source_id === activeSourceId)?.kind !== 'browser')}>{cameraOn ? 'Cerrar cámara' : 'Abrir cámara'}</button>
+            {cameraOn && <button className="button button-accent button-purple" onClick={() => void captureFromVideo().then((blob) => { if (!blob) return; const width = videoRef.current?.videoWidth || 1; const height = videoRef.current?.videoHeight || 1; setPreviewSafely({ blob, url: URL.createObjectURL(blob), width, height }); stopCamera(); void inspect(blob) })} disabled={busy || !canControl || Boolean(status?.maintenance_mode)}>Analizar toma</button>}
+            {!cameraOn && <button className="button button-accent button-purple" onClick={() => void inspect(backendPreviewBlob || preview?.blob)} disabled={busy || (!preview && !backendPreviewBlob && activeSourceId !== 'laptop_builtin' && activeSourceId !== 'usb_webcam' && activeSourceId !== 'remote_phone') || !canControl || Boolean(status?.maintenance_mode)}>{busy ? 'Analizando…' : (activeSourceId === 'laptop_builtin' || activeSourceId === 'usb_webcam') ? 'Escanear Cámara Web' : activeSourceId === 'remote_phone' ? 'Escanear Cámara Remota' : 'Analizar foto'}</button>}
           </div>
-          <div className="viewer-tools"><span>Vista del overlay</span><button className={fit === 'contain' ? 'selected' : ''} onClick={() => setFit('contain')}>Completa</button><button className={fit === 'cover' ? 'selected' : ''} onClick={() => setFit('cover')}>Recortada</button><label className="continuous-toggle"><input type="checkbox" checked={continuous} onChange={(e) => setContinuous(e.target.checked)} disabled={!cameraOn || !session} /> Continuo <small>experimental</small></label></div>
+            <div className="viewer-tools"><span>Vista del overlay</span><button className={fit === 'contain' ? 'selected' : ''} onClick={() => setFit('contain')}>Completa</button><button className={fit === 'cover' ? 'selected' : ''} onClick={() => setFit('cover')}>Recortada</button><label className="continuous-toggle"><input type="checkbox" checked={continuous} onChange={(e) => setContinuous(e.target.checked)} disabled={!session || (!cameraOn && !backendPreviewBlob && activeSourceId !== 'laptop_builtin' && activeSourceId !== 'usb_webcam')} /> Continuo <small>2 FPS</small></label></div>
           {error && <div className="alert alert-error" role="alert"><strong>No se completó la acción.</strong> {error}</div>}
           {leaseMessage && <div className="alert alert-info" role="status">{leaseMessage}</div>}
         </section>
 
         <aside className="results" aria-label="Resultados de la inspección">
+          <section className="panel inventory-3x3-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">Inventario Físico</p>
+                <h2>Estado de Tablero (3x3)</h2>
+              </div>
+              <span className="count">
+                {analysis ? `${detectedCount} detectada${detectedCount === 1 ? '' : 's'} / ${notDetectedCount} no detectada${notDetectedCount === 1 ? '' : 's'}` : `${toolSlots.length} casilleros`}
+              </span>
+            </div>
+            <div className="inventory-3x3-grid">
+              {toolSlots.map((slot) => {
+                const cardClass = analysis
+                  ? slot.isStored
+                    ? 'inventory-slot-card stored'
+                    : 'inventory-slot-card missing'
+                  : 'inventory-slot-card'
+                const dotClass = analysis
+                  ? slot.isStored
+                    ? 'inventory-status-dot stored'
+                    : 'inventory-status-dot missing'
+                  : 'inventory-status-dot'
+                return (
+                  <div key={slot.index} className={cardClass}>
+                    <div className="inventory-slot-header">
+                      <span className="inventory-slot-name">{slot.name}</span>
+                      <span className={dotClass} />
+                    </div>
+                    <div className="inventory-slot-footer">
+                      <span className="inventory-slot-location">{slot.location}</span>
+                      {analysis && (
+                        <span className={`inventory-slot-status-text ${slot.isStored ? 'stored' : 'missing'}`}>
+                          {slot.isStored ? 'DETECTADA EN LECTURA' : 'NO DETECTADA EN ESTA LECTURA'}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </section>
+
           <section className="panel result-panel"><div className="panel-heading"><div><p className="eyebrow">Lectura</p><h2>Herramientas detectadas</h2></div><span className="count">{detections.length}</span></div>
             {detections.length ? <div className="detection-list">{detections.map((d) => <article className="detection" key={`${d.track_id}-${d.class_id}`}><div className="detection-mark" aria-hidden="true" /><div><strong>{d.name || 'Sin identificar'}</strong><span>{displayLocation(d.location)} · track {d.track_id} · similitud {formatSimilarity(d.similarity_top1)}</span></div><b>{d.validation === 'simulated' ? 'SIM' : d.class_id}</b></article>)}</div> : <p className="empty-copy">Las lecturas válidas de la fotografía aparecerán aquí. Los objetos ambiguos permanecen sin asignación.</p>}
           </section>
+
+          <section className="panel activity-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">Registro Local</p>
+                <h2>Actividad Reciente</h2>
+              </div>
+              <span className="mode-chip">Hoy</span>
+            </div>
+            <div className="activity-feed-panel">
+              {activityLogs.map((log) => (
+                <div key={log.id} className="activity-feed-item">
+                  <span className={`activity-feed-dot ${log.type}`} />
+                  <span className="activity-feed-time">{log.time}</span>
+                  <span className="activity-feed-msg">{log.message}</span>
+                </div>
+              ))}
+            </div>
+          </section>
           <section className="panel led-panel"><div className="panel-heading"><div><p className="eyebrow">Salida física</p><h2>Mapa de luces</h2></div><span className={`ack ${analysis?.arduino.ack ? 'ack-ok' : ''}`}>{analysis ? analysis.arduino.ack ? analysis.arduino.simulated ? 'ACK simulado' : 'ACK confirmado' : 'Sin confirmación' : 'Sin lectura'}</span></div><div className="led-grid">{ledItems.map((led) => <div className="led-cell" key={led.bit}><span className={`led ${led.confirmed === true ? 'led-confirmed' : led.requested ? 'led-requested' : ''}`} aria-label={`${led.name}: ${led.confirmed === null ? 'sin confirmación' : led.confirmed ? 'confirmada' : led.requested ? 'solicitada' : 'apagada'}`} /><div><strong>{led.name}</strong><span>{led.confirmed === null ? 'Sin confirmación' : led.confirmed ? 'Confirmada' : led.requested ? 'Solicitada' : 'Apagada'}</span></div></div>)}</div><p className="legend"><span className="dot dot-confirmed" /> Confirmada <span className="dot dot-requested" /> Solicitada</p></section>
           {analysis && <section className="panel detail-panel"><div className="panel-heading"><div><p className="eyebrow">Trazabilidad</p><h2>Detalle de lectura</h2></div></div><div className="detail-grid"><span>Frame <strong>{analysis.frame_id.slice(0, 12)}</strong></span><span>Track <strong>{analysis.detections[0]?.track_id ?? '—'}</strong></span><span>Modo <strong>{analysis.mode}</strong></span><span>Validación <strong>{analysis.detections[0]?.validation || 'Sin detecciones'}</strong></span><span>Captura <strong>{formatMetric(analysis.metrics?.capture_fps, 'fps')}</strong></span><span>Presentación <strong>{formatMetric(analysis.metrics?.display_fps, 'fps')}</strong></span><span>Inferencia <strong>{formatMetric(analysis.metrics?.inference_hz, 'Hz')}</strong></span><span>Latencia p50 <strong>{formatMetric(analysis.metrics?.inference_ms_p50, 'ms')}</strong><small>{metricSampleLabel(analysis.metrics?.stages?.embed?.sample_count ?? analysis.metrics?.sample_count)}</small></span><span>Latencia p95 <strong>{formatMetric(analysis.metrics?.inference_ms_p95, 'ms')}</strong><small>{metricSampleLabel(analysis.metrics?.stages?.embed?.sample_count ?? analysis.metrics?.sample_count)}</small></span><span>VRAM <strong>{formatMetric(analysis.metrics?.vram_mb, 'MB', 'No disponible')}</strong></span><span>Backend → ACK <strong>{formatMetric(analysis.metrics?.capture_to_ack_ms, 'ms', analysis.simulated || analysis.arduino.simulated ? 'No disponible en simulación' : 'Sin muestras suficientes')}</strong></span>{Object.entries(analysis.metrics?.stages || analysis.metrics?.stage_ms || {}).map(([stage, metric]) => <span key={stage}>{stage} <strong>{formatMetric(metric?.p50_ms, 'ms')}</strong><small>{metricSampleLabel(metric?.sample_count)}</small></span>)}</div></section>}
-          <section className="panel settings-panel"><button className="panel-heading disclosure" onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen}><div><p className="eyebrow">Conexión</p><h2>Sesión y backend</h2></div><span aria-hidden="true">{settingsOpen ? '⌃' : '⌄'}</span></button>{settingsOpen && <div className="settings-body"><label>URL del backend<input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} disabled={Boolean(session)} placeholder="http://192.168.1.20:8000" /></label><label>ID de este teléfono<input value={deviceId} onChange={(e) => setDeviceId(e.target.value)} disabled={Boolean(session)} /></label><label>Rol de sesión<select value={requestedRole} onChange={(e) => setRequestedRole(e.target.value as 'controller' | 'reader' | 'admin')} disabled={Boolean(session)}><option value="controller">Controlador · cámara y Arduino</option><option value="reader">Lector · solo resultados</option><option value="admin">Administrador · configuración, calibración y hardware</option></select></label><label>{requestedRole === 'admin' ? 'Clave de administrador' : 'Clave de emparejamiento'}<input type="password" value={pairingKey} onChange={(e) => setPairingKey(e.target.value)} disabled={Boolean(session)} placeholder="Configurada en la laptop" /></label>{session ? <button className="button button-danger full" onClick={() => void release()}>Liberar sesión</button> : <button className="button button-accent full" onClick={() => void connect()} disabled={connection === 'checking' || !apiUrl}>{connection === 'checking' ? 'Verificando…' : 'Verificar y conectar'}</button>}{preview && session?.role === 'admin' && <button className="button button-secondary full" onClick={() => void (async () => { setCalibrating(true); setError(''); try { await calibrateBackground(apiUrl, session, preview.blob); const latest = await getConfig(apiUrl, session); mergeReferenceRefresh(latest); setLeaseMessage('Fondo vacío guardado para esta cámara.') } catch (caught) { setError(caught instanceof Error ? caught.message : 'No se pudo guardar el fondo') } finally { setCalibrating(false) } })()} disabled={calibrating}>{calibrating ? 'Guardando fondo…' : 'Usar foto actual como fondo vacío'}</button>}<div className="connection-note"><span className={`status-dot status-${connection}`} />{session ? session.role === 'admin' ? 'Sesión administrativa · Control total del sistema' : session.role === 'reader' ? 'Sesión lectora; no controla el Arduino' : 'Control exclusivo de este teléfono' : 'Sin sesión de control'}{status?.arduino?.simulated && <em>Arduino simulado</em>}</div>{inventory.length > 0 && <p className="inventory-note">{inventoryExample ? 'Inventario de ejemplo' : 'Inventario confirmado'}: {inventory.map((item, index) => item.name || item.location || `LED ${item.led_index ?? item.bit ?? index}`).join(' · ')}</p>}</div>}</section>
+          <section className="panel settings-panel"><button className="panel-heading disclosure" onClick={() => setSettingsOpen(!settingsOpen)} aria-expanded={settingsOpen}><div><p className="eyebrow">Conexión</p><h2>Sesión y backend</h2></div><span aria-hidden="true">{settingsOpen ? '⌃' : '⌄'}</span></button>{settingsOpen && <div className="settings-body"><label>URL del backend<input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} disabled={Boolean(session)} placeholder="http://192.168.1.20:8000" /></label><label>ID de este teléfono<input value={deviceId} onChange={(e) => setDeviceId(e.target.value)} disabled={Boolean(session)} /></label><label>Rol de sesión<select value={requestedRole} onChange={(e) => setRequestedRole(e.target.value as 'controller' | 'reader' | 'admin')} disabled={Boolean(session)}><option value="controller">Controlador · cámara y Arduino</option><option value="reader">Lector · solo resultados</option><option value="admin">Administrador · configuración, calibración y hardware</option></select></label><label>{requestedRole === 'admin' ? 'Clave de administrador' : 'Clave de emparejamiento'}<input type="password" value={pairingKey} onChange={(e) => setPairingKey(e.target.value)} disabled={Boolean(session)} placeholder="Configurada en la laptop" /></label>{session ? <button className="button button-danger full" onClick={() => void release()}>Liberar sesión</button> : <button className="button button-accent full" onClick={() => void connect()} disabled={connection === 'checking' || !apiUrl}>{connection === 'checking' ? 'Verificando…' : 'Verificar y conectar'}</button>}{session && session.role === 'admin' && <button className="button button-secondary full" onClick={() => void handleTakeover()} title="Tomar control físico exclusivo como administrador">Tomar Control Físico (Admin Takeover)</button>}{preview && session?.role === 'admin' && <button className="button button-secondary full" onClick={() => void (async () => { setCalibrating(true); setError(''); try { await calibrateBackground(apiUrl, session, preview.blob); const latest = await getConfig(apiUrl, session); mergeReferenceRefresh(latest); setLeaseMessage('Fondo vacío guardado para esta cámara.') } catch (caught) { setError(caught instanceof Error ? caught.message : 'No se pudo guardar el fondo') } finally { setCalibrating(false) } })()} disabled={calibrating}>{calibrating ? 'Guardando fondo…' : 'Usar foto actual como fondo vacío'}</button>}<div className="connection-note"><span className={`status-dot status-${connection}`} />{session ? session.role === 'admin' ? 'Sesión administrativa · Control total del sistema' : session.role === 'reader' ? 'Sesión lectora; no controla el Arduino' : 'Control exclusivo de este teléfono' : 'Sin sesión de control'}{status?.arduino?.simulated && <em>Arduino simulado</em>}</div>{inventory.length > 0 && <p className="inventory-note">{inventoryExample ? 'Inventario de ejemplo' : 'Inventario confirmado'}: {inventory.map((item, index) => item.name || item.location || `LED ${item.led_index ?? item.bit ?? index}`).join(' · ')}</p>}</div>}</section>
         </aside>
       </div>
     )}
@@ -812,6 +1367,15 @@ export default function App() {
       />
     )}
 
-    <footer><span>ToolLighthouse · análisis en laptop</span><span>Modo continuo requiere HTTPS o localhost · WebRTC queda preparado para una fase posterior</span></footer>
+    {qrModalOpen && activeInvite && (
+      <QRModal
+        inviteUrl={activeInvite.invite_url}
+        expiresAt={activeInvite.expires_at}
+        onClose={() => setQrModalOpen(false)}
+        onCancelInvite={handleCancelInvite}
+      />
+    )}
+
+    <footer><span>ToolLighthouse · análisis en laptop</span><span>Modo continuo requiere HTTPS o localhost · WebRTC activo para streaming</span></footer>
   </main>
 }

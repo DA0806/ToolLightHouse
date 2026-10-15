@@ -30,7 +30,99 @@ PORTABLE_SETTINGS_FIELDS = {
     "photo_retention_seconds",
     "prediction_max_age_seconds",
     "prediction_interval_seconds",
+    "calibration_profiles",
+    "camera_sources",
 }
+
+
+@dataclass
+class CalibrationProfile:
+    source_id: str
+    resolution: dict[str, int] = field(default_factory=lambda: {"width": 1280, "height": 720})
+    orientation: str = "normal"          # "normal" | "rotate_90" | "rotate_180" | "rotate_270"
+    crop: tuple[int, int, int, int] | None = None
+    processing_version: int = 2
+    background_filename: str | None = None
+    roi: tuple[int, int, int, int] | None = None
+    calibrated_at: float = 0.0
+    status: str = "needs_calibration"   # "ready" | "needs_calibration" | "incompatible" | "needs_confirmation"
+
+    def __post_init__(self):
+        if self.orientation not in {"normal", "rotate_90", "rotate_180", "rotate_270"}:
+            raise ValueError("calibration orientation is invalid")
+        if not isinstance(self.resolution, dict) or any(
+            isinstance(self.resolution.get(key), bool) or not isinstance(self.resolution.get(key), int) or self.resolution.get(key) <= 0
+            for key in ("width", "height")
+        ):
+            raise ValueError("calibration resolution must contain positive width and height")
+        for name, value in (("crop", self.crop), ("roi", self.roi)):
+            if value is not None and (len(value) != 4 or any(isinstance(v, bool) or not isinstance(v, int) for v in value) or value[2] <= 0 or value[3] <= 0):
+                raise ValueError(f"calibration {name} must be [x, y, width, height]")
+        if self.processing_version <= 0:
+            raise ValueError("calibration processing_version must be positive")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_id": self.source_id,
+            "resolution": dict(self.resolution),
+            "orientation": self.orientation,
+            "crop": list(self.crop) if self.crop else None,
+            "processing_version": self.processing_version,
+            "background_filename": self.background_filename,
+            "roi": list(self.roi) if self.roi else None,
+            "calibrated_at": self.calibrated_at,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CalibrationProfile":
+        crop_raw = data.get("crop")
+        crop = tuple(int(v) for v in crop_raw) if crop_raw and len(crop_raw) == 4 else None
+        roi_raw = data.get("roi")
+        roi = tuple(int(v) for v in roi_raw) if roi_raw and len(roi_raw) == 4 else None
+        return cls(
+            source_id=str(data.get("source_id", "unknown")),
+            resolution=dict(data.get("resolution", {"width": 1280, "height": 720})),
+            orientation=str(data.get("orientation", "normal")),
+            crop=crop,
+            processing_version=int(data.get("processing_version", 2)),
+            background_filename=data.get("background_filename"),
+            roi=roi,
+            calibrated_at=float(data.get("calibrated_at", 0.0)),
+            status=str(data.get("status", "needs_calibration")),
+        )
+
+
+def apply_canonical_transform(
+    raw_frame: Any,
+    orientation: str = "normal",
+    crop: tuple[int, int, int, int] | None = None,
+) -> Any:
+    """
+    Applies identical spatial normalization (rotation + crop) to both
+    empty tray calibration backgrounds and live/photo inference frames.
+    """
+    if raw_frame is None:
+        return None
+    import cv2
+    frame = raw_frame
+    if orientation == "rotate_90":
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    elif orientation == "rotate_180":
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
+    elif orientation == "rotate_270":
+        frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    if crop is not None and len(crop) == 4:
+        x, y, w, h = crop
+        h_img, w_img = frame.shape[:2]
+        x1 = max(0, min(x, w_img - 1))
+        y1 = max(0, min(y, h_img - 1))
+        x2 = max(x1 + 1, min(x + w, w_img))
+        y2 = max(y1 + 1, min(y + h, h_img))
+        frame = frame[y1:y2, x1:x2]
+    return frame
+
 
 
 @dataclass(frozen=True)
@@ -193,6 +285,8 @@ class Settings:
     device: str = "auto"
     require_background: bool = False
     model_path: str = "models/embeddinggemma-2"
+    calibration_profiles: dict[str, CalibrationProfile] = field(default_factory=dict)
+    camera_sources: dict[str, Any] = field(default_factory=dict)
     inventory: Inventory = field(default_factory=Inventory.example)
 
     def __post_init__(self):
@@ -279,6 +373,28 @@ class Settings:
         if "inventory" in raw and isinstance(raw["inventory"], dict):
             categories = [ToolCategory.from_dict(c) for c in raw["inventory"]["categories"]]
             data["inventory"] = Inventory(categories, example=bool(raw["inventory"].get("example", False)))
+
+        if "calibration_profiles" in raw and isinstance(raw["calibration_profiles"], dict):
+            data["calibration_profiles"] = {
+                k: v if isinstance(v, CalibrationProfile) else CalibrationProfile.from_dict(v)
+                for k, v in raw["calibration_profiles"].items()
+            }
+        elif ("background_path" in raw and raw["background_path"]) or ("roi" in raw and raw["roi"]):
+            bg_p = raw.get("background_path")
+            bg_fn = Path(bg_p).name if bg_p else None
+            roi_raw = raw.get("roi")
+            roi_val = tuple(int(v) for v in roi_raw) if roi_raw and len(roi_raw) == 4 else None
+            data["calibration_profiles"] = {
+                "unbound_legacy": CalibrationProfile(
+                    source_id="unbound_legacy",
+                    resolution={"width": 1280, "height": 720},
+                    orientation="normal",
+                    background_filename=bg_fn,
+                    roi=roi_val,
+                    status="needs_confirmation",
+                )
+            }
+
         settings = cls(**data)
         if settings.session_ttl_seconds <= 0 or settings.lease_ttl_seconds <= 0 or settings.max_upload_bytes <= 0 or settings.max_pixels <= 0 or not all(math.isfinite(float(value)) for value in (settings.classifier_threshold, settings.classifier_margin, settings.text_weight)):
             raise ValueError("session, lease, upload, pixel and classifier settings must be finite and positive where applicable")
@@ -332,6 +448,11 @@ class Settings:
             "device": self.device,
             "require_background": self.require_background,
             "model_path": self.model_path,
+            "calibration_profiles": {
+                k: v.to_dict() if hasattr(v, "to_dict") else v
+                for k, v in self.calibration_profiles.items()
+            },
+            "camera_sources": self.camera_sources,
             "inventory": self.inventory.to_dict(),
         }
 

@@ -3,7 +3,11 @@ import type {
   ArduinoLedTestResponse,
   ArduinoMaintenanceResponse,
   ArduinoStatus,
+  BackendCameraSourceDescriptor,
   CalibrationMeta,
+  CalibrationProfile,
+  CameraInviteResponse,
+  CameraSourcesResponse,
   ComPort,
   ConfigResponse,
   ConfigStatusResponse,
@@ -16,6 +20,7 @@ import type {
   StatusResponse,
   SystemReadiness,
   WsEvent,
+  CameraSourceDescriptor,
 } from './types'
 
 export interface Credentials {
@@ -36,6 +41,15 @@ export class ApiError extends Error {
 
 export function normalizeApiUrl(url: string): string {
   return url.trim().replace(/\/+$/, '')
+}
+
+export function websocketUrl(baseUrl: string, path: string): string {
+  const parsed = new URL(normalizeApiUrl(baseUrl))
+  parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:'
+  parsed.pathname = path.startsWith('/') ? path : `/${path}`
+  parsed.search = ''
+  parsed.hash = ''
+  return parsed.toString()
 }
 
 export function defaultApiUrl(): string {
@@ -119,10 +133,19 @@ export function analyzePhoto(baseUrl: string, credentials: Credentials, file: Bl
   }, timeoutMs)
 }
 
-export function streamFrame(baseUrl: string, credentials: Credentials, file: Blob, timeoutMs = 12000): Promise<{ accepted: boolean; frame_id: string; latest_only: boolean; result?: AnalysisResponse }> {
+export function streamFrame(
+  baseUrl: string,
+  credentials: Credentials,
+  file: Blob,
+  timeoutMs = 12000,
+  sourceContext?: { sourceId?: string; sourceVersion?: number },
+): Promise<{ accepted: boolean; frame_id: string; latest_only: boolean; result?: AnalysisResponse }> {
   const body = new FormData()
   body.append('file', file, file instanceof File ? file.name : 'stream.jpg')
-  return request(`${normalizeApiUrl(baseUrl)}/v1/stream/frame`, { method: 'POST', headers: authHeaders(credentials), body }, timeoutMs)
+  const headers = new Headers(authHeaders(credentials))
+  if (sourceContext?.sourceId) headers.set('X-Source-Id', sourceContext.sourceId)
+  if (sourceContext?.sourceVersion !== undefined) headers.set('X-Source-Version', String(sourceContext.sourceVersion))
+  return request(`${normalizeApiUrl(baseUrl)}/v1/stream/frame`, { method: 'POST', headers, body }, timeoutMs)
 }
 
 export async function releaseSession(baseUrl: string, credentials: Credentials, timeoutMs = 5000): Promise<void> {
@@ -140,9 +163,7 @@ export function calibrateBackground(baseUrl: string, credentials: Credentials, f
 }
 
 export function openEvents(baseUrl: string, credentials: Credentials, onEvent: (event: WsEvent) => void, onState: (state: 'open' | 'closed' | 'error') => void): { close: () => void } {
-  const parsed = new URL(normalizeApiUrl(baseUrl))
-  parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:'
-  parsed.pathname = `${parsed.pathname.replace(/\/$/, '')}/v1/ws`
+  const parsed = new URL(websocketUrl(baseUrl, '/v1/ws'))
   if (!credentials.wsTicket) throw new ApiError('No se obtuvo un ticket efímero para WebSocket')
   parsed.searchParams.set('ticket', credentials.wsTicket)
   parsed.searchParams.set('session_id', credentials.sessionId)
@@ -333,6 +354,235 @@ export function testLed(baseUrl: string, credentials: Credentials, idx: number, 
 
 export function allOff(baseUrl: string, credentials: Credentials, timeoutMs = 5000): Promise<{ arduino: ArduinoStatus }> {
   return request<{ arduino: ArduinoStatus }>(`${normalizeApiUrl(baseUrl)}/v1/arduino/maintenance/all-off`, {
+    method: 'POST',
+    headers: authHeaders(credentials),
+  }, timeoutMs)
+}
+
+// Camera Management & Five-Source Integration
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : null
+}
+
+export function decodeCameraSourceDescriptor(value: unknown): CameraSourceDescriptor {
+  const raw = asRecord(value)
+  if (!raw || typeof raw.source_id !== 'string' || typeof raw.display_name !== 'string') {
+    throw new ApiError('La respuesta de fuentes de cámara no tiene un identificador o nombre válido')
+  }
+  const canonicalSourceIds = new Set(['remote_phone', 'laptop_builtin', 'usb_webcam', 'operator_device', 'manual_upload'])
+  if (!canonicalSourceIds.has(raw.source_id)) {
+    throw new ApiError(`Fuente de cámara no soportada: ${raw.source_id}`)
+  }
+  const resolution = asRecord(raw.current_resolution)
+  const width = Number(resolution?.width)
+  const height = Number(resolution?.height)
+  const fps = Number(raw.current_fps)
+  if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0 || !Number.isFinite(fps) || fps < 0) {
+    throw new ApiError(`La fuente de cámara ${raw.source_id} no tiene resolución o FPS válidos`)
+  }
+  const kindByBackend: Record<string, CameraSourceDescriptor['kind']> = {
+    webrtc_remote: 'webrtc',
+    opencv_builtin: 'opencv',
+    opencv_usb: 'opencv',
+    browser_local: 'browser',
+    manual_upload: 'file',
+  }
+  const kind = kindByBackend[String(raw.kind)]
+  if (!kind) throw new ApiError(`Tipo de fuente de cámara no soportado: ${String(raw.kind)}`)
+  const status = String(raw.status)
+  const validStatuses = new Set(['active', 'standby', 'disconnected', 'error', 'needs_calibration'])
+  if (!validStatuses.has(status)) throw new ApiError(`Estado de fuente de cámara no soportado: ${status}`)
+  if (typeof raw.calibration_profile_available !== 'boolean') {
+    throw new ApiError(`La fuente de cámara ${raw.source_id} no informa disponibilidad de calibración`)
+  }
+  return {
+    source_id: raw.source_id,
+    name: raw.display_name,
+    kind,
+    status: status as CameraSourceDescriptor['status'],
+    resolution: { width, height },
+    fps,
+    requires_operator_action: raw.connection_type === 'browser' || raw.connection_type === 'file',
+    calibration_available: raw.calibration_profile_available,
+    connection_type: typeof raw.connection_type === 'string' ? raw.connection_type : undefined,
+    is_active: raw.is_active === true,
+    last_error: typeof raw.last_error === 'string' ? raw.last_error : null,
+  }
+}
+
+export function decodeCameraSourcesResponse(value: unknown): CameraSourcesResponse {
+  const raw = asRecord(value)
+  if (!raw || !Array.isArray(raw.sources) || typeof raw.active_source_id !== 'string' || !Number.isFinite(Number(raw.source_version))) {
+    throw new ApiError('La respuesta de fuentes de cámara no tiene el contrato esperado')
+  }
+  return {
+    sources: raw.sources.map(decodeCameraSourceDescriptor),
+    active_source_id: raw.active_source_id,
+    source_version: Number(raw.source_version),
+  }
+}
+
+export async function getCameraSources(baseUrl: string, credentials: Credentials, timeoutMs = 5000): Promise<CameraSourcesResponse> {
+  const raw = await request<BackendCameraSourceDescriptor[] | CameraSourcesResponse>(`${normalizeApiUrl(baseUrl)}/v1/camera/sources`, {
+    headers: authHeaders(credentials),
+  }, timeoutMs)
+  return decodeCameraSourcesResponse(raw)
+}
+
+export function setActiveCameraSource(baseUrl: string, credentials: Credentials, sourceId: string, timeoutMs = 8000): Promise<{ success: boolean; active_source_id: string; source_version: number; calibration_status?: string }> {
+  return request<{ success: boolean; active_source_id: string; source_version: number; calibration_status?: string }>(`${normalizeApiUrl(baseUrl)}/v1/camera/sources/active`, {
+    method: 'POST',
+    headers: { ...authHeaders(credentials), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source_id: sourceId }),
+  }, timeoutMs)
+}
+
+export interface WebCamDevice {
+  index: number
+  name: string
+  width?: number
+  height?: number
+  fps?: number
+  is_active: boolean
+}
+
+export function getWebcams(baseUrl: string, credentials: Credentials, timeoutMs = 8000): Promise<{ devices: WebCamDevice[] }> {
+  return request<{ devices: WebCamDevice[] }>(`${normalizeApiUrl(baseUrl)}/v1/camera/webcams`, {
+    headers: authHeaders(credentials),
+  }, timeoutMs)
+}
+
+export function updateCameraSourceSettings(
+  baseUrl: string,
+  credentials: Credentials,
+  sourceId: string,
+  settings: { device_index?: number; width?: number; height?: number; fps?: number },
+  timeoutMs = 8000
+): Promise<{ success: boolean; profile_status: string }> {
+  return request<{ success: boolean; profile_status: string }>(`${normalizeApiUrl(baseUrl)}/v1/camera/sources/${encodeURIComponent(sourceId)}/settings`, {
+    method: 'POST',
+    headers: { ...authHeaders(credentials), 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  }, timeoutMs)
+}
+
+export function createCameraInvite(baseUrl: string, credentials: Credentials, timeoutMs = 5000): Promise<CameraInviteResponse> {
+  return request<CameraInviteResponse>(`${normalizeApiUrl(baseUrl)}/v1/camera/invite`, {
+    method: 'POST',
+    headers: authHeaders(credentials),
+  }, timeoutMs)
+}
+
+export function cancelCameraInvite(baseUrl: string, credentials: Credentials, inviteId: string, timeoutMs = 5000): Promise<{ cancelled: boolean }> {
+  return request<{ cancelled: boolean }>(`${normalizeApiUrl(baseUrl)}/v1/camera/invite/${encodeURIComponent(inviteId)}`, {
+    method: 'DELETE',
+    headers: authHeaders(credentials),
+  }, timeoutMs)
+}
+
+export function revokeCameraTransmitters(baseUrl: string, credentials: Credentials, timeoutMs = 5000): Promise<{ revoked: boolean; disconnected_transmitters: number }> {
+  return request<{ revoked: boolean; disconnected_transmitters: number }>(`${normalizeApiUrl(baseUrl)}/v1/camera/revoke`, {
+    method: 'POST',
+    headers: authHeaders(credentials),
+  }, timeoutMs)
+}
+
+export async function scanTools(baseUrl: string, credentials: Credentials, file?: File | Blob, timeoutMs = 15000): Promise<AnalysisResponse> {
+  const formData = new FormData()
+  if (file) {
+    formData.append('file', file, 'scan.jpg')
+  }
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(`${normalizeApiUrl(baseUrl)}/v1/analyze/scan`, {
+      method: 'POST',
+      headers: authHeaders(credentials),
+      body: file ? formData : undefined,
+      signal: controller.signal,
+    })
+    const body = await response.text()
+    let parsed: unknown = null
+    try { parsed = body ? JSON.parse(body) : null } catch { parsed = body }
+    if (!response.ok) {
+      const detail = typeof parsed === 'object' && parsed && 'detail' in parsed
+        ? String((parsed as { detail: unknown }).detail)
+        : `HTTP ${response.status}`
+      throw new ApiError(detail, response.status)
+    }
+    return parsed as AnalysisResponse
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw new ApiError('Tiempo de espera agotado al escanear', 408)
+    if (error instanceof ApiError) throw error
+    throw new ApiError('No se pudo contactar al backend')
+  } finally {
+    window.clearTimeout(timeout)
+  }
+}
+
+export function takeoverLease(baseUrl: string, credentials: Credentials, timeoutMs = 5000): Promise<{ success: boolean; lease_generation: number; holder: string }> {
+  return request<{ success: boolean; lease_generation: number; holder: string }>(`${normalizeApiUrl(baseUrl)}/v1/sessions/lease/takeover`, {
+    method: 'POST',
+    headers: authHeaders(credentials),
+  }, timeoutMs)
+}
+
+export function sessionHeartbeat(baseUrl: string, credentials: Credentials, timeoutMs = 5000): Promise<{ success: boolean; lease_held: boolean; lease_generation: number; expires_in: number }> {
+  return request<{ success: boolean; lease_held: boolean; lease_generation: number; expires_in: number }>(`${normalizeApiUrl(baseUrl)}/v1/sessions/heartbeat`, {
+    method: 'POST',
+    headers: authHeaders(credentials),
+  }, timeoutMs)
+}
+
+export function getCalibrationProfiles(baseUrl: string, credentials: Credentials, timeoutMs = 5000): Promise<{ profiles: Record<string, CalibrationProfile> }> {
+  return request<{ profiles: Record<string, CalibrationProfile> }>(`${normalizeApiUrl(baseUrl)}/v1/calibration/profiles`, {
+    headers: authHeaders(credentials),
+  }, timeoutMs)
+}
+
+export async function captureProfileBackground(baseUrl: string, credentials: Credentials, sourceId: string, file?: File | Blob, timeoutMs = 15000): Promise<CalibrationProfile> {
+  const formData = new FormData()
+  if (file) {
+    formData.append('file', file, 'bg.jpg')
+  }
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(`${normalizeApiUrl(baseUrl)}/v1/calibration/profiles/${encodeURIComponent(sourceId)}/capture`, {
+      method: 'POST',
+      headers: authHeaders(credentials),
+      body: file ? formData : undefined,
+      signal: controller.signal,
+    })
+    const body = await response.text()
+    let parsed: unknown = null
+    try { parsed = body ? JSON.parse(body) : null } catch { parsed = body }
+    if (!response.ok) {
+      const detail = typeof parsed === 'object' && parsed && 'detail' in parsed
+        ? String((parsed as { detail: unknown }).detail)
+        : `HTTP ${response.status}`
+      throw new ApiError(detail, response.status)
+    }
+    return parsed as CalibrationProfile
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw new ApiError('Tiempo de espera agotado al capturar calibración', 408)
+    if (error instanceof ApiError) throw error
+    throw new ApiError('No se pudo contactar al backend')
+  } finally {
+    window.clearTimeout(timeout)
+  }
+}
+
+export function updateProfileRoi(baseUrl: string, credentials: Credentials, sourceId: string, roi: [number, number, number, number], timeoutMs = 5000): Promise<CalibrationProfile> {
+  return request<CalibrationProfile>(`${normalizeApiUrl(baseUrl)}/v1/calibration/profiles/${encodeURIComponent(sourceId)}/roi`, {
+    method: 'PUT',
+    headers: { ...authHeaders(credentials), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roi }),
+  }, timeoutMs)
+}
+
+export function confirmLegacyProfile(baseUrl: string, credentials: Credentials, sourceId: string, timeoutMs = 5000): Promise<CalibrationProfile> {
+  return request<CalibrationProfile>(`${normalizeApiUrl(baseUrl)}/v1/calibration/profiles/${encodeURIComponent(sourceId)}/confirm-legacy`, {
     method: 'POST',
     headers: authHeaders(credentials),
   }, timeoutMs)
