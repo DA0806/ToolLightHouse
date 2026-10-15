@@ -121,7 +121,7 @@ En el dashboard de la tablet:
 2. En la tablet, diríjase a la pestaña **Calibración** (sección *Reconocimiento IA y Bandeja Vacía*).
 3. En **«Perfiles de Calibración por Cámara (Multicámara)»**, pulse la pastilla **`remote_phone`** y confirme que indique la fuente seleccionada.
 4. En la tarjeta `1. Imagen de Fondo (Bandeja Vacía)`, pulse **«📷 Tomar foto de bandeja vacía (Cámara)»** (o si cuenta con un archivo previo, «📁 Seleccionar archivo de fondo»).
-5. El sistema guardará la imagen de referencia para la sustracción de fondo y segmentación de contornos.
+5. El sistema guardará la imagen de referencia para la sustracción de fondo y segmentación de contornos. Tras la instantánea (snapshot) o congelamiento del visor remoto, reabra la transmisión en vivo pulsando el botón **«Abrir cámara»** (sin requerir escanear un nuevo código QR). Si alterna de fuente o resolución, seleccione un perfil compatible o recapture el fondo y la ROI si existiera incompatibilidad.
 
 ### 13. Delimitación de la Región de Interés (ROI)
 1. En la misma pestaña de Calibración, ubíquese en la tarjeta `2. Delimitación de Región de Interés (ROI)`.
@@ -162,8 +162,8 @@ En el dashboard de la tablet:
 ### 19. Resiliencia Operativa y Alternativas de Cámara ante Contingencias
 1. Si durante la demostración la red local sufre congestión o caídas de paquetes WebRTC, el cliente móvil en el teléfono conmuta automáticamente a subida de fotogramas vía HTTP JPEG (`POST /v1/camera/frame-upload`).
 2. Si requiere cambiar de fuente de video durante la sesión:
-   - Use el desplegable `Fuente de Video` para alternar a **Cámara web integrada (laptop_builtin)**, **Cámara web externa USB (usb_webcam)** o **Carga manual de imagen (manual_upload)**.
-3. Si el teléfono se recarga o se desconecta, el token efímero original quedó consumido: pulse nuevamente **«Vincular Celular (QR)»** en la tablet para generar una nueva invitación.
+   - Use el desplegable `Fuente de Video` para alternar a **Cámara web integrada (laptop_builtin)**, **Cámara web externa USB (usb_webcam)** o **Carga manual de imagen (manual_upload)**. Ante cualquier cambio de fuente o de resolución, utilice un perfil de calibración compatible o recapture el fondo y la ROI si existiera incompatibilidad.
+3. Si el teléfono se recarga o se desconecta, el token efímero original quedó consumido: pulse nuevamente **«Vincular Celular (QR)»** en la tablet para generar una nueva invitación. Si la transmisión remota se pausó tras una instantánea o congelamiento con el mismo dispositivo par (peer), no requiere generar un nuevo QR: pulse directamente el botón **«Abrir cámara»** para reanudar el flujo.
 > [!WARNING] **Prácticas Prohibidas durante la Demostración**
 > - **JAMÁS bloquee deliberadamente puertos UDP o el cortafuegos durante la presentación.**
 > - **NO altere ni reduzca los umbrales de clasificación para forzar falsos positivos.** Conserve los parámetros nominales validados en la calibración.
@@ -214,3 +214,11 @@ Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 | **Error al iniciar: "Port 8000 occupied" o "Duplicate instance"** | Quedó un proceso previo de Python o Uvicorn en segundo plano. | Identifique el proceso con `Get-CimInstance Win32_Process -Filter "Name LIKE 'python%'"` y ciérrelo antes de reiniciar. |
 | **Arduino no conecta o no figura en la lista de puertos** | Cable USB desconectado o inventario no confirmado. | Reconecte el cable USB. Confirme el inventario de 9 herramientas en la pestaña «Herramientas» y pulse «Conectar Arduino». |
 | **Detecciones inestables o fondo no segmentado** | Iluminación ambiental modificada tras la calibración. | Retire las herramientas y pulse «📷 Tomar foto de bandeja vacía (Cámara)» nuevamente con la luz actual de la sala. |
+
+---
+
+## Seguridad Operativa y Límites de Despliegue
+
+- **Control de Acceso, Roles y Leases:** Los endpoints protegidos y el canal de señalización WebSocket validan de forma estricta el rol de la sesión, los leases físicos y el origen de señalización (`signalOrigin`).
+- **Resolución de Host y Código QR:** La URL del código QR se compone a partir del encabezado `Host` de la petición del cliente (`requestHost`) y no aplica una lista blanca estricta (`Host whitelist`).
+- **Límites de Despliegue (Fuera de Alcance):** El endurecimiento adicional mediante allowlist de hosts y la exposición en Internet público están formalmente fuera del alcance de este release. El sistema está diseñado exclusivamente para redes LAN confiables (IP numérica privada o router Wi-Fi dedicado) con TLS confiable instalado. No se debe asumir ni reclamar seguridad pública completa en redes abiertas.
