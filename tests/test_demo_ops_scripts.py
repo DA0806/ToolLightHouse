@@ -285,6 +285,27 @@ def test_preflight_missing_certs_in_isolated_fixture(tmp_path):
 
 
 @windows_only
+def test_preflight_reports_actual_selected_venv_cuda_truth(tmp_path):
+    """The CUDA line must reflect the selected venv, including on PowerShell 5.1."""
+    try:
+        import torch
+    except ImportError:
+        pytest.skip("Selected test venv has no PyTorch")
+    if not torch.cuda.is_available():
+        pytest.skip("Selected test venv has no CUDA device")
+
+    fixture_dir = tmp_path / "cuda_fixture"
+    (fixture_dir / "scripts").mkdir(parents=True)
+    shutil.copy(REPO_ROOT / "scripts" / "preflight.ps1", fixture_dir / "scripts" / "preflight.ps1")
+    shutil.copy(REPO_ROOT / "scripts" / "network_helpers.ps1", fixture_dir / "scripts" / "network_helpers.ps1")
+    shutil.copy(REPO_ROOT / "scripts" / "demo_tls_check.py", fixture_dir / "scripts" / "demo_tls_check.py")
+
+    res = _run_ps_command("& '.\\scripts\\preflight.ps1' -LanIP '192.168.0.11'", cwd=fixture_dir)
+    gpu_name = torch.cuda.get_device_name(0)
+    assert f"[PASS] CUDA / GPU: CUDA available: {gpu_name}" in res.stdout
+
+
+@windows_only
 def test_start_demo_rejects_occupied_port_in_isolated_fixture(tmp_path):
     """Verify start-demo.ps1 rejects startup when designated port is occupied, in an isolated fixture."""
     fixture_dir = tmp_path / "project_fixture"

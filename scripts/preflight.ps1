@@ -138,8 +138,15 @@ try {
     # 3. CUDA & GPU Acceleration
     if ($pythonExe) {
         $cudaInfo = try {
-            $cudaScript = 'import torch; print(f"{torch.cuda.is_available()}|{torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}")'
-            & $pythonExe -c $cudaScript 2>$null
+            # Feed the probe through stdin. PowerShell 5 can strip nested quotes
+            # from Python -c arguments, producing a false CPU result on CUDA hosts.
+            $cudaScript = @'
+import torch
+available = bool(torch.cuda.is_available())
+name = torch.cuda.get_device_name(0) if available else "None"
+print(("True" if available else "False") + "|" + name)
+'@
+            $cudaScript | & $pythonExe - 2>$null
         } catch { "False|None" }
         $parts = ($cudaInfo | Out-String).Trim().Split('|')
         $cudaAvail = if ($parts.Length -ge 1) { $parts[0] -eq "True" } else { $false }
