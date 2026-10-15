@@ -40,7 +40,7 @@ def generate_test_certs(
     days: int = 365,
 ) -> tuple[Path, Path, Path]:
     """Generate temporary test certificate, matching key, and wrong key at runtime via OpenSSL.
-    
+
     Skips the test if OpenSSL is not available. Does not touch user certificate stores.
     """
     openssl = find_openssl()
